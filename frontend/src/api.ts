@@ -245,3 +245,23 @@ export async function adminListAuditLogs(limit: number, offset: number) {
     method: 'GET'
   })
 }
+
+export async function adminExportBackup() {
+  const token = localStorage.getItem(TOKEN_KEY)
+  const response = await fetch(`${API_BASE}/admin/backup/export`, {
+    method: 'GET',
+    headers: token ? { Authorization: `Bearer ${token}` } : {}
+  })
+  if (!response.ok) {
+    const data = await response.json().catch(() => ({ error: '导出备份失败' }))
+    throw new Error(data.error ?? '导出备份失败')
+  }
+  return response.blob()
+}
+
+export async function adminImportBackup(payload: unknown) {
+  return request<{ message: string }>('/admin/backup/import', {
+    method: 'POST',
+    body: JSON.stringify(payload)
+  })
+}

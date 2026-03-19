@@ -1,6 +1,8 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import {
+  adminExportBackup,
+  adminImportBackup,
   adminDeleteUser,
   adminListAuditLogs,
   adminListUsers,
@@ -73,6 +75,8 @@ const auditPage = ref(1)
 const auditPageSize = ref(12)
 const auditTotal = ref(0)
 const loadingAudit = ref(false)
+const exportingBackup = ref(false)
+const importingBackup = ref(false)
 const editReturnContext = ref<{ tab: 'pending' | 'expired'; page: number } | null>(null)
 const authMode = ref<AuthMode>('login')
 const editingEventId = ref<number | null>(null)
@@ -688,6 +692,51 @@ async function loadAuditLogs() {
     auditTotal.value = response.total
   } finally {
     loadingAudit.value = false
+  }
+}
+
+async function exportBackupFile() {
+  exportingBackup.value = true
+  resetMessages()
+  try {
+    const blob = await adminExportBackup()
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `waitwhat-backup-${new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)}.json`
+    document.body.appendChild(a)
+    a.click()
+    a.remove()
+    URL.revokeObjectURL(url)
+    successMessage.value = '备份文件已导出。'
+  } catch (error) {
+    errorMessage.value = normalizeErrorMessage(error, '导出备份失败')
+  } finally {
+    exportingBackup.value = false
+  }
+}
+
+async function handleImportBackupFile(event: Event) {
+  const input = event.target as HTMLInputElement
+  const file = input.files?.[0]
+  if (!file) return
+  importingBackup.value = true
+  resetMessages()
+  try {
+    const text = await file.text()
+    const payload = JSON.parse(text)
+    const confirmed = await openConfirm('导入会覆盖当前数据库中的用户、事件、通知等数据，确定继续吗？', '导入备份')
+    if (!confirmed) return
+    await adminImportBackup(payload)
+    successMessage.value = '备份导入成功，数据已刷新。'
+    await loadData({ silent: true })
+    await loadManagedUsers()
+    await loadAuditLogs()
+  } catch (error) {
+    errorMessage.value = normalizeErrorMessage(error, '导入备份失败')
+  } finally {
+    importingBackup.value = false
+    input.value = ''
   }
 }
 
@@ -1872,6 +1921,21 @@ watch(
                   </button>
                 </div>
               </section>
+            </section>
+            <section class="subpanel top-gap">
+              <div class="panel-head align-center">
+                <div><p class="section-label">Backup</p><h3>备份与恢复</h3></div>
+              </div>
+              <p class="field-hint">导出为 JSON 备份文件；导入会覆盖当前系统数据，请先自行保留一份备份。</p>
+              <div class="form-actions">
+                <button class="primary-btn" :disabled="exportingBackup || importingBackup" @click="exportBackupFile">
+                  {{ exportingBackup ? '导出中...' : '导出备份' }}
+                </button>
+                <label class="secondary-btn file-upload-btn" :class="importingBackup && 'disabled'">
+                  {{ importingBackup ? '导入中...' : '导入备份' }}
+                  <input type="file" accept=".json,application/json" :disabled="importingBackup || exportingBackup" @change="handleImportBackupFile" />
+                </label>
+              </div>
             </section>
             <section class="subpanel top-gap">
               <div class="panel-head align-center">

@@ -320,3 +320,134 @@ type AuthResponse struct {
 	Token string `json:"token"`
 	User  User   `json:"user"`
 }
+
+type BackupUser struct {
+	ID           int64  `json:"id"`
+	Username     string `json:"username"`
+	Name         string `json:"name"`
+	Email        string `json:"email"`
+	Role         string `json:"role"`
+	PasswordHash string `json:"passwordHash"`
+	CreatedAt    string `json:"createdAt"`
+}
+
+type BackupNotificationChannel struct {
+	ID          int64  `json:"id"`
+	UserID      int64  `json:"userId"`
+	Type        string `json:"type"`
+	Name        string `json:"name"`
+	Target      string `json:"target"`
+	Enabled     int    `json:"enabled"`
+	LastChecked string `json:"lastChecked"`
+}
+
+type BackupMemoEvent struct {
+	ID              int64  `json:"id"`
+	UserID          int64  `json:"userId"`
+	Title           string `json:"title"`
+	Content         string `json:"content"`
+	EventAt         string `json:"eventAt"`
+	ReminderEnabled int    `json:"reminderEnabled"`
+	RecurrenceType  string `json:"recurrenceType"`
+	RecurrenceExpr  string `json:"recurrenceExpr"`
+	BoundChannelIDs string `json:"boundChannelIds"`
+	BoundGroupIDs   string `json:"boundGroupIds"`
+	CountdownLabel  string `json:"countdownLabel"`
+	Status          string `json:"status"`
+	CreatedAt       string `json:"createdAt"`
+	UpdatedAt       string `json:"updatedAt"`
+}
+
+type BackupReminderPoint struct {
+	ID        int64  `json:"id"`
+	EventID   int64  `json:"eventId"`
+	Label     string `json:"label"`
+	OffsetMin int    `json:"offsetMin"`
+}
+
+type BackupNotificationLog struct {
+	ID          int64  `json:"id"`
+	EventID     int64  `json:"eventId"`
+	ReminderID  int64  `json:"reminderId"`
+	ChannelType string `json:"channelType"`
+	ChannelName string `json:"channelName"`
+	Status      string `json:"status"`
+	Message     string `json:"message"`
+	TriggeredAt string `json:"triggeredAt"`
+}
+
+type BackupReminderTask struct {
+	ID          int64  `json:"id"`
+	EventID     int64  `json:"eventId"`
+	ReminderID  int64  `json:"reminderId"`
+	ChannelID   int64  `json:"channelId"`
+	ChannelType string `json:"channelType"`
+	Status      string `json:"status"`
+	ScheduledAt string `json:"scheduledAt"`
+	TriggeredAt string `json:"triggeredAt"`
+	LastError   string `json:"lastError"`
+	RetryCount  int    `json:"retryCount"`
+	MaxRetries  int    `json:"maxRetries"`
+}
+
+type BackupNotificationGroup struct {
+	ID      int64  `json:"id"`
+	UserID  int64  `json:"userId"`
+	Name    string `json:"name"`
+	Enabled int    `json:"enabled"`
+}
+
+type BackupNotificationGroupMember struct {
+	ID      int64  `json:"id"`
+	GroupID int64  `json:"groupId"`
+	Type    string `json:"type"`
+	Label   string `json:"label"`
+	Target  string `json:"target"`
+	Secret  string `json:"secret"`
+	Keyword string `json:"keyword"`
+	UseSign int    `json:"useSign"`
+	Enabled int    `json:"enabled"`
+}
+
+type BackupUserMailSetting struct {
+	UserID      int64  `json:"userId"`
+	Enabled     int    `json:"enabled"`
+	Host        string `json:"host"`
+	Port        int    `json:"port"`
+	Username    string `json:"username"`
+	Password    string `json:"password"`
+	FromName    string `json:"fromName"`
+	FromAddress string `json:"fromAddress"`
+	UseTLS      int    `json:"useTls"`
+	UseSSL      int    `json:"useSsl"`
+	Initialized string `json:"initialized"`
+}
+
+type BackupUserDingTalkSetting struct {
+	UserID      int64  `json:"userId"`
+	Enabled     int    `json:"enabled"`
+	Webhook     string `json:"webhook"`
+	Secret      string `json:"secret"`
+	UseSign     int    `json:"useSign"`
+	Keyword     string `json:"keyword"`
+	Initialized string `json:"initialized"`
+}
+
+type BackupPayload struct {
+	Version    int    `json:"version"`
+	ExportedAt string `json:"exportedAt"`
+
+	LoginMaxFailed int `json:"loginMaxFailed"`
+	LoginWindowSec int `json:"loginWindowSec"`
+
+	Users                    []BackupUser                    `json:"users"`
+	NotificationChannels     []BackupNotificationChannel     `json:"notificationChannels"`
+	MemoEvents               []BackupMemoEvent               `json:"memoEvents"`
+	ReminderPoints           []BackupReminderPoint           `json:"reminderPoints"`
+	NotificationLogs         []BackupNotificationLog         `json:"notificationLogs"`
+	ReminderTasks            []BackupReminderTask            `json:"reminderTasks"`
+	NotificationGroups       []BackupNotificationGroup       `json:"notificationGroups"`
+	NotificationGroupMembers []BackupNotificationGroupMember `json:"notificationGroupMembers"`
+	UserMailSettings         []BackupUserMailSetting         `json:"userMailSettings"`
+	UserDingTalkSettings     []BackupUserDingTalkSetting     `json:"userDingTalkSettings"`
+}

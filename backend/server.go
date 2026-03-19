@@ -136,6 +136,8 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("/api/admin/users/", s.handleAdminUserByID)
 	mux.HandleFunc("/api/admin/login-policy", s.handleAdminLoginPolicy)
 	mux.HandleFunc("/api/admin/audit-logs", s.handleAdminAuditLogs)
+	mux.HandleFunc("/api/admin/backup/export", s.handleAdminBackupExport)
+	mux.HandleFunc("/api/admin/backup/import", s.handleAdminBackupImport)
 	mux.HandleFunc("/api/mail/config", s.handleMailConfig)
 	mux.HandleFunc("/api/mail/test", s.handleMailTest)
 	mux.HandleFunc("/api/mail/diagnose", s.handleMailDiagnose)
@@ -787,6 +789,68 @@ func (s *Server) handleAdminAuditLogs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"items": items, "total": total})
+}
+
+func (s *Server) handleAdminBackupExport(w http.ResponseWriter, r *http.Request) {
+	admin, err := s.requireAdmin(r)
+	if err != nil {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": err.Error()})
+		return
+	}
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	payload, err := s.repo.ExportBackup(r.Context())
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	data, err := json.MarshalIndent(payload, "", "  ")
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	filename := fmt.Sprintf("waitwhat-backup-%s.json", time.Now().Format("20060102-150405"))
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", filename))
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(data)
+	_ = s.repo.AppendAdminAuditLog(r.Context(), admin, AdminAuditLog{
+		Action:         "admin_export_backup",
+		TargetUserID:   admin.ID,
+		TargetUsername: admin.Username,
+		Detail:         "管理员导出系统备份",
+	})
+}
+
+func (s *Server) handleAdminBackupImport(w http.ResponseWriter, r *http.Request) {
+	admin, err := s.requireAdmin(r)
+	if err != nil {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": err.Error()})
+		return
+	}
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	var payload BackupPayload
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "备份文件解析失败"})
+		return
+	}
+	if err := s.repo.ImportBackup(r.Context(), payload); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	s.loginLimiter.Update(s.repo.cfg.Auth.LoginLimitMaxFail, time.Duration(s.repo.cfg.Auth.LoginLimitWindow)*time.Second)
+	_ = s.repo.AppendAdminAuditLog(r.Context(), admin, AdminAuditLog{
+		Action:         "admin_import_backup",
+		TargetUserID:   admin.ID,
+		TargetUsername: admin.Username,
+		Detail:         "管理员导入系统备份",
+	})
+	writeJSON(w, http.StatusOK, map[string]string{"message": "备份导入成功"})
 }
 
 func (s *Server) requireAuth(r *http.Request) (User, error) {

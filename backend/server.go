@@ -146,8 +146,35 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("/api/notify-groups/", s.handleNotifyGroupByID)
 	mux.HandleFunc("/api/events", s.handleEvents)
 	mux.HandleFunc("/api/events/", s.handleEventByID)
+	registerFrontendRoutes(mux)
 
 	return withRequestLogging(withCORS(mux))
+}
+
+func registerFrontendRoutes(mux *http.ServeMux) {
+	webDir := strings.TrimSpace(envOrDefault("APP_WEB_DIR", "./web"))
+	if webDir == "" {
+		return
+	}
+	indexPath := webDir + "/index.html"
+	if _, err := os.Stat(indexPath); err != nil {
+		log.Printf("frontend static disabled: %s not found", indexPath)
+		return
+	}
+	log.Printf("frontend static enabled: %s", webDir)
+	fileServer := http.FileServer(http.Dir(webDir))
+	mux.Handle("/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/api/") {
+			http.NotFound(w, r)
+			return
+		}
+		target := webDir + r.URL.Path
+		if info, err := os.Stat(target); err == nil && !info.IsDir() {
+			fileServer.ServeHTTP(w, r)
+			return
+		}
+		http.ServeFile(w, r, indexPath)
+	}))
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {

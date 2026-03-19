@@ -1,6 +1,8 @@
 import type { AppState, AuthUser, DatabaseDriver } from './types'
 
-const API_BASE = (import.meta.env.VITE_API_BASE as string | undefined) ?? 'http://localhost:8080/api'
+const API_BASE =
+  (import.meta.env.VITE_API_BASE as string | undefined) ??
+  (import.meta.env.DEV ? 'http://localhost:8080/api' : `${window.location.origin}/api`)
 const TOKEN_KEY = 'waitwhat-auth-token'
 
 function authHeaders() {

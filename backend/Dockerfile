@@ -10,17 +10,16 @@ WORKDIR /src/backend
 COPY backend/go.mod backend/go.sum ./
 RUN go mod download
 COPY backend/ ./
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /out/waitwhat-backend .
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o /out/waitwhat-backend .
+RUN mkdir -p /out/data
 
-FROM alpine:3.20
+FROM gcr.io/distroless/static-debian12:nonroot
 WORKDIR /app
 
-RUN addgroup -S app && adduser -S app -G app
-COPY --from=backend-builder /out/waitwhat-backend /app/waitwhat-backend
-COPY --from=frontend-builder /src/frontend/dist /app/web
-RUN mkdir -p /app/data /app/web && chown -R app:app /app
+COPY --chown=65532:65532 --from=backend-builder /out/waitwhat-backend /app/waitwhat-backend
+COPY --chown=65532:65532 --from=frontend-builder /src/frontend/dist /app/web
+COPY --chown=65532:65532 --from=backend-builder /out/data /app/data
 
-USER app
 EXPOSE 8080
 ENV APP_PORT=8080
 ENV APP_DATA_DIR=/app/data

@@ -402,7 +402,13 @@ func (s *Server) handleMailTest(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := s.repo.SendTestMail(r.Context(), user.ID, req.To); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		msg := err.Error()
+		log.Printf("mail test failed user_id=%d username=%s to=%s err=%s", user.ID, user.Username, req.To, msg)
+		if strings.Contains(msg, "测试邮箱不能为空") || strings.Contains(msg, "邮件发送未启用") || strings.Contains(msg, "SMTP 配置不完整") {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": msg})
+			return
+		}
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": msg})
 		return
 	}
 

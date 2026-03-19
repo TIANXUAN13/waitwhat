@@ -72,6 +72,8 @@ export interface CreateEventPayload {
   content: string
   eventAt: string
   reminderEnabled: boolean
+  recurrenceType: 'once' | 'daily' | 'workday' | 'cron'
+  recurrenceExpr: string
   reminderPoints: Array<{ id: number; label: string; offsetMin: number }>
   boundChannelIds: number[]
   boundGroupIds: number[]
@@ -186,7 +188,7 @@ export async function diagnoseMail(host: string) {
 }
 
 export async function dispatchReminders() {
-  return request<{ message: string; result: { triggered: number; sent: number; failed: number; skipped: number } }>(
+  return request<{ message: string; result: { triggered: number; sent: number; failed: number; skipped: number; retried: number } }>(
     '/reminders/dispatch',
     { method: 'POST' }
   )
@@ -206,4 +208,38 @@ export async function saveNotifyGroup(payload: SaveNotifyGroupPayload) {
 
 export async function deleteNotifyGroup(id: number) {
   return request(`/notify-groups/${id}`, { method: 'DELETE' })
+}
+
+export async function adminListUsers() {
+  return request<{ users: AuthUser[] }>('/admin/users', { method: 'GET' })
+}
+
+export async function adminUpdateUserPassword(userId: number, password: string) {
+  return request<{ message: string }>(`/admin/users/${userId}`, { method: 'PUT', body: JSON.stringify({ password }) })
+}
+
+export async function adminDeleteUser(userId: number) {
+  return request<{ message: string }>(`/admin/users/${userId}`, { method: 'DELETE' })
+}
+
+export async function adminUpdateLoginPolicy(payload: { loginMaxFailed: number; loginWindowSec: number }) {
+  return request<{ message: string; policy: { loginMaxFailed: number; loginWindowSec: number } }>('/admin/login-policy', {
+    method: 'POST',
+    body: JSON.stringify(payload)
+  })
+}
+
+export async function adminListAuditLogs(limit: number, offset: number) {
+  return request<{ items: Array<{
+    id: number
+    actorUserId: number
+    actorUsername: string
+    action: string
+    targetUserId: number
+    targetUsername: string
+    detail: string
+    createdAt: string
+  }>; total: number }>(`/admin/audit-logs?limit=${limit}&offset=${offset}`, {
+    method: 'GET'
+  })
 }

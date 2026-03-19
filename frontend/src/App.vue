@@ -1,6 +1,11 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import {
+  adminDeleteUser,
+  adminListAuditLogs,
+  adminListUsers,
+  adminUpdateLoginPolicy,
+  adminUpdateUserPassword,
   clearToken,
   createEvent,
   deleteNotifyGroup,
@@ -23,7 +28,7 @@ import {
   setupAdmin,
   updateEvent
 } from './api'
-import type { AppState, AuthUser, DatabaseDriver, NotificationGroup } from './types'
+import type { AdminAuditLog, AppState, AuthUser, DatabaseDriver, NotificationGroup } from './types'
 
 interface ReminderOption {
   key: string
@@ -32,11 +37,12 @@ interface ReminderOption {
   selected: boolean
 }
 
-type ViewMode = 'composer' | 'list' | 'notify' | 'settings'
+type ViewMode = 'composer' | 'list' | 'notify' | 'users' | 'settings'
 type AuthMode = 'login' | 'register'
 
 const SETTINGS_KEY = 'waitwhat-ui-settings'
 const LOGIN_READY_HINT_SEEN_KEY = 'waitwhat-login-ready-hint-seen'
+const COMPOSER_DRAFT_KEY = 'waitwhat-composer-draft'
 
 const loading = ref(true)
 const submitting = ref(false)
@@ -47,16 +53,38 @@ const diagnosingMail = ref(false)
 const dispatching = ref(false)
 const savingUi = ref(false)
 const authSubmitting = ref(false)
+const savingLoginPolicy = ref(false)
+const resettingUserPasswordId = ref(0)
+const deletingUser = ref(false)
 const errorMessage = ref('')
 const successMessage = ref('')
 const appState = ref<AppState | null>(null)
 const currentView = ref<ViewMode>('composer')
 const listFocus = ref<'pending' | 'expired'>('pending')
+const listQuery = ref('')
+const listSort = ref<'time_asc' | 'time_desc' | 'title_asc'>('time_asc')
+const selectedEventIds = ref<number[]>([])
+const pendingPage = ref(1)
+const expiredPage = ref(1)
+const listPageSize = ref(12)
+const userPage = ref(1)
+const userPageSize = ref(12)
+const auditPage = ref(1)
+const auditPageSize = ref(12)
+const auditTotal = ref(0)
+const loadingAudit = ref(false)
+const editReturnContext = ref<{ tab: 'pending' | 'expired'; page: number } | null>(null)
 const authMode = ref<AuthMode>('login')
 const editingEventId = ref<number | null>(null)
 const showLoginReadyHint = ref(false)
 const showMailConfig = ref(true)
 const showResetInit = computed(() => /no such column|SQL logic error|database/i.test(errorMessage.value))
+const bootstrapError = ref('')
+const backendUnavailable = computed(() => !loading.value && !appState.value && Boolean(bootstrapError.value))
+const managedUsers = ref<AuthUser[]>([])
+const adminAuditLogs = ref<AdminAuditLog[]>([])
+const userEditorVisible = ref(false)
+const editingManagedUserId = ref(0)
 
 const dbForm = reactive({
   driver: '' as DatabaseDriver | '',
@@ -83,6 +111,13 @@ const authForm = reactive({
   name: ''
 })
 
+const loginPolicyForm = reactive({
+  loginMaxFailed: 5,
+  loginWindowSec: 600
+})
+
+const userPasswordDraft = reactive<Record<number, string>>({})
+
 const uiSettings = reactive({
   projectName: 'WaitWhat',
   slogan: '清新的提醒工作台',
@@ -90,20 +125,38 @@ const uiSettings = reactive({
   displaySubTitle: '专注你的每个关键节点'
 })
 
+function nowDateTimeLocal() {
+  const now = new Date()
+  const offsetMs = now.getTimezoneOffset() * 60 * 1000
+  return new Date(now.getTime() - offsetMs).toISOString().slice(0, 16)
+}
+
 const reminderDraft = reactive({
   title: '新的事项提醒',
   content: '这里可以写会议准备、账单提醒、待办安排等。',
-  eventAt: '2026-03-20T18:30',
-  customValue: 0,
-  customUnit: 'minute',
+  eventAt: nowDateTimeLocal(),
+  recurrenceType: 'once' as 'once' | 'daily' | 'workday' | 'cron',
+  recurrenceExpr: '',
   testMailTo: ''
 })
 
+const cronDraft = reactive({
+  minute: '0',
+  hour: '9',
+  day: '*',
+  month: '*',
+  weekday: '1-5'
+})
+
 const reminderOptions = reactive<ReminderOption[]>([
-  { key: 'day-1', label: '提前 1 天', offsetMin: 1440, selected: true },
-  { key: 'hour-2', label: '提前 2 小时', offsetMin: 120, selected: true },
-  { key: 'min-10', label: '提前 10 分钟', offsetMin: 10, selected: true }
+  { key: 'day-1', label: '提前 1 天', offsetMin: 1440, selected: false },
+  { key: 'hour-2', label: '提前 2 小时', offsetMin: 120, selected: false },
+  { key: 'min-10', label: '提前 10 分钟', offsetMin: 10, selected: false }
 ])
+const customReminderDraft = reactive({
+  value: 0,
+  unit: 'minute' as 'minute' | 'hour' | 'day'
+})
 
 const selectedGroupIds = ref<number[]>([])
 
@@ -150,20 +203,43 @@ const databaseConfigured = computed(() => isRealInitializedAt(appState.value?.da
 const adminConfigured = computed(() => Boolean(appState.value?.auth.adminExists))
 const currentUser = computed<AuthUser | null>(() => appState.value?.auth.currentUser ?? null)
 const loggedIn = computed(() => Boolean(currentUser.value))
+const isAdmin = computed(() => currentUser.value?.role === 'admin')
 const notifyGroups = computed<NotificationGroup[]>(() => appState.value?.notifyGroups ?? [])
 const events = computed(() => appState.value?.events ?? [])
 const tasks = computed(() => appState.value?.tasks ?? [])
 const logs = computed(() => appState.value?.logs ?? [])
+function normalizedRecurrence(type?: string) {
+  return (type || 'once').trim().toLowerCase()
+}
+
 const pendingEvents = computed(() =>
-  events.value
-    .filter((event) => new Date(event.eventAt).getTime() >= Date.now())
-    .sort((a, b) => new Date(a.eventAt).getTime() - new Date(b.eventAt).getTime())
+  events.value.filter((event) => normalizedRecurrence(event.recurrenceType) !== 'once' || new Date(event.eventAt).getTime() >= Date.now())
 )
 const expiredEvents = computed(() =>
-  events.value
-    .filter((event) => new Date(event.eventAt).getTime() < Date.now())
-    .sort((a, b) => new Date(b.eventAt).getTime() - new Date(a.eventAt).getTime())
+  events.value.filter((event) => normalizedRecurrence(event.recurrenceType) === 'once' && new Date(event.eventAt).getTime() < Date.now())
 )
+const filteredPendingEvents = computed(() => {
+  const keyword = listQuery.value.trim().toLowerCase()
+  const base = keyword
+    ? pendingEvents.value.filter((event) => event.title.toLowerCase().includes(keyword) || event.content.toLowerCase().includes(keyword))
+    : pendingEvents.value
+  return [...base].sort((a, b) => {
+    if (listSort.value === 'time_desc') return new Date(b.eventAt).getTime() - new Date(a.eventAt).getTime()
+    if (listSort.value === 'title_asc') return a.title.localeCompare(b.title, 'zh-CN')
+    return new Date(a.eventAt).getTime() - new Date(b.eventAt).getTime()
+  })
+})
+const filteredExpiredEvents = computed(() => {
+  const keyword = listQuery.value.trim().toLowerCase()
+  const base = keyword
+    ? expiredEvents.value.filter((event) => event.title.toLowerCase().includes(keyword) || event.content.toLowerCase().includes(keyword))
+    : expiredEvents.value
+  return [...base].sort((a, b) => {
+    if (listSort.value === 'time_asc') return new Date(a.eventAt).getTime() - new Date(b.eventAt).getTime()
+    if (listSort.value === 'title_asc') return a.title.localeCompare(b.title, 'zh-CN')
+    return new Date(b.eventAt).getTime() - new Date(a.eventAt).getTime()
+  })
+})
 const filteredNotifyGroups = computed(() => {
   const keyword = groupQuery.value.trim().toLowerCase()
   if (!keyword) return notifyGroups.value
@@ -172,13 +248,35 @@ const filteredNotifyGroups = computed(() => {
     return group.members.some((member) => member.label.toLowerCase().includes(keyword) || member.target.toLowerCase().includes(keyword))
   })
 })
+
+const pendingTotalPages = computed(() => Math.max(1, Math.ceil(filteredPendingEvents.value.length / listPageSize.value)))
+const expiredTotalPages = computed(() => Math.max(1, Math.ceil(filteredExpiredEvents.value.length / listPageSize.value)))
+const userTotalPages = computed(() => Math.max(1, Math.ceil(managedUsers.value.length / userPageSize.value)))
+const auditTotalPages = computed(() => Math.max(1, Math.ceil(auditTotal.value / auditPageSize.value)))
+const pagedPendingEvents = computed(() => {
+  const start = (pendingPage.value - 1) * listPageSize.value
+  return filteredPendingEvents.value.slice(start, start + listPageSize.value)
+})
+const pagedExpiredEvents = computed(() => {
+  const start = (expiredPage.value - 1) * listPageSize.value
+  return filteredExpiredEvents.value.slice(start, start + listPageSize.value)
+})
+const pagedManagedUsers = computed(() => {
+  const start = (userPage.value - 1) * userPageSize.value
+  return managedUsers.value.slice(start, start + userPageSize.value)
+})
+const currentTabEvents = computed(() => (listFocus.value === 'pending' ? filteredPendingEvents.value : filteredExpiredEvents.value))
+const currentPageEvents = computed(() => (listFocus.value === 'pending' ? pagedPendingEvents.value : pagedExpiredEvents.value))
+const allCurrentPageSelected = computed(() => {
+  const ids = currentPageEvents.value.map((item) => item.id)
+  return ids.length > 0 && ids.every((id) => selectedEventIds.value.includes(id))
+})
+const editingManagedUser = computed(() => managedUsers.value.find((item) => item.id === editingManagedUserId.value) || null)
 const groupDraftSnapshot = ref('')
 const isGroupDirty = computed(() => groupDraftSnapshot.value !== serializeGroupDraft())
 
 const selectedReminderSummary = computed(() => {
   const items = reminderOptions.filter((item) => item.selected).map((item) => item.label)
-  const custom = customReminderLabel()
-  if (custom) items.push(custom)
   items.push('到点提醒')
   return items
 })
@@ -191,7 +289,33 @@ const summaryStats = computed(() => ({
   success: logs.value.filter((log) => log.status === 'success').length
 }))
 
+const recurrenceSummary = computed(() => {
+  if (reminderDraft.recurrenceType === 'daily') return '每天'
+  if (reminderDraft.recurrenceType === 'workday') return '工作日（周一到周五）'
+  if (reminderDraft.recurrenceType === 'cron') {
+    return reminderDraft.recurrenceExpr.trim() ? `Cron: ${reminderDraft.recurrenceExpr.trim()}` : 'Cron（未填写表达式）'
+  }
+  return '一次性'
+})
+
 const emailReady = computed(() => Boolean(mailForm.enabled && mailForm.host && mailForm.fromAddress))
+
+function renderRecurrence(type?: string, expr?: string) {
+  const value = normalizedRecurrence(type)
+  if (value === 'daily') return '每天'
+  if (value === 'workday') return '工作日'
+  if (value === 'cron') return expr ? `Cron: ${expr}` : 'Cron'
+  return '一次性'
+}
+
+const composerEventAtText = computed(() => {
+  if (reminderDraft.recurrenceType === 'cron') {
+    return '由 Cron 表达式决定触发时间'
+  }
+  return reminderDraft.eventAt || '请选择时间'
+})
+
+const cronPreview = computed(() => `${cronDraft.minute} ${cronDraft.hour} ${cronDraft.day} ${cronDraft.month} ${cronDraft.weekday}`)
 
 function resetMessages() {
   errorMessage.value = ''
@@ -218,6 +342,51 @@ function normalizeErrorMessage(error: unknown, fallback: string) {
   return raw
 }
 
+function syncCronExprFromDraft() {
+  reminderDraft.recurrenceExpr = cronPreview.value.trim()
+}
+
+function syncCronDraftFromExpr(expr: string) {
+  const fields = expr.trim().split(/\s+/)
+  if (fields.length !== 5) return
+  ;[cronDraft.minute, cronDraft.hour, cronDraft.day, cronDraft.month, cronDraft.weekday] = fields
+}
+
+function customOffsetMinutes() {
+  const raw = Number(customReminderDraft.value || 0)
+  if (!Number.isFinite(raw) || raw <= 0) return 0
+  if (customReminderDraft.unit === 'day') return Math.floor(raw * 1440)
+  if (customReminderDraft.unit === 'hour') return Math.floor(raw * 60)
+  return Math.floor(raw)
+}
+
+function customReminderLabel(offsetMin: number) {
+  if (offsetMin % 1440 === 0) return `提前 ${offsetMin / 1440} 天`
+  if (offsetMin % 60 === 0) return `提前 ${offsetMin / 60} 小时`
+  return `提前 ${offsetMin} 分钟`
+}
+
+function addCustomReminderOption() {
+  const offsetMin = customOffsetMinutes()
+  if (offsetMin <= 0) {
+    errorMessage.value = '自定义预提醒必须大于 0'
+    return
+  }
+  const existed = reminderOptions.find((item) => item.offsetMin === offsetMin)
+  if (existed) {
+    existed.selected = true
+    successMessage.value = '该预提醒已存在，已为你选中。'
+    return
+  }
+  reminderOptions.push({
+    key: `custom-${offsetMin}-${Date.now()}`,
+    label: customReminderLabel(offsetMin),
+    offsetMin,
+    selected: true
+  })
+  successMessage.value = '已添加自定义预提醒。'
+}
+
 function loadUiSettings() {
   const raw = localStorage.getItem(SETTINGS_KEY)
   if (!raw) return
@@ -228,6 +397,54 @@ function loadUiSettings() {
   }
 }
 
+function saveComposerDraft() {
+  const payload = {
+    title: reminderDraft.title,
+    content: reminderDraft.content,
+    eventAt: reminderDraft.eventAt,
+    recurrenceType: reminderDraft.recurrenceType,
+    recurrenceExpr: reminderDraft.recurrenceExpr,
+    reminderOffsets: reminderOptions.filter((item) => item.selected).map((item) => item.offsetMin),
+    selectedGroupIds: selectedGroupIds.value
+  }
+  localStorage.setItem(COMPOSER_DRAFT_KEY, JSON.stringify(payload))
+}
+
+function restoreComposerDraft() {
+  const raw = localStorage.getItem(COMPOSER_DRAFT_KEY)
+  if (!raw) return
+  try {
+    const draft = JSON.parse(raw) as {
+      title?: string
+      content?: string
+      eventAt?: string
+      recurrenceType?: 'once' | 'daily' | 'workday' | 'cron'
+      recurrenceExpr?: string
+      reminderOffsets?: number[]
+      selectedGroupIds?: number[]
+    }
+    if (draft.title) reminderDraft.title = draft.title
+    if (draft.content) reminderDraft.content = draft.content
+    if (draft.eventAt) reminderDraft.eventAt = draft.eventAt
+    if (draft.recurrenceType) reminderDraft.recurrenceType = draft.recurrenceType
+    reminderDraft.recurrenceExpr = draft.recurrenceExpr || ''
+    if (Array.isArray(draft.reminderOffsets)) {
+      reminderOptions.forEach((item) => {
+        item.selected = draft.reminderOffsets?.includes(item.offsetMin) ?? false
+      })
+    }
+    if (Array.isArray(draft.selectedGroupIds)) {
+      selectedGroupIds.value = [...new Set(draft.selectedGroupIds)]
+    }
+  } catch {
+    return
+  }
+}
+
+function clearComposerDraft() {
+  localStorage.removeItem(COMPOSER_DRAFT_KEY)
+}
+
 function saveUiSettings() {
   savingUi.value = true
   localStorage.setItem(SETTINGS_KEY, JSON.stringify(uiSettings))
@@ -235,20 +452,6 @@ function saveUiSettings() {
   setTimeout(() => {
     savingUi.value = false
   }, 250)
-}
-
-function customReminderLabel() {
-  if (!reminderDraft.customValue || reminderDraft.customValue <= 0) return ''
-  const unitMap: Record<string, string> = { minute: '分钟', hour: '小时', day: '天' }
-  return `提前 ${reminderDraft.customValue} ${unitMap[reminderDraft.customUnit]}`
-}
-
-function customReminderOffsetMin() {
-  const value = Number(reminderDraft.customValue)
-  if (!value || value <= 0) return 0
-  if (reminderDraft.customUnit === 'day') return value * 1440
-  if (reminderDraft.customUnit === 'hour') return value * 60
-  return value
 }
 
 function toggleGroup(id: number) {
@@ -283,6 +486,9 @@ async function switchView(nextView: ViewMode) {
   if (nextView === 'list' && currentView.value !== 'list') {
     listFocus.value = 'pending'
   }
+  if (nextView === 'users' && isAdmin.value) {
+    await loadManagedUsers()
+  }
   currentView.value = nextView
   if (nextView !== 'notify') {
     notifyEditorVisible.value = false
@@ -303,9 +509,13 @@ function toDateTimeLocal(value: string) {
   return new Date(date.getTime() - offsetMs).toISOString().slice(0, 16)
 }
 
-async function loadData() {
-  loading.value = true
+async function loadData(options?: { silent?: boolean }) {
+  const silent = options?.silent === true
+  if (!silent) {
+    loading.value = true
+  }
   resetMessages()
+  bootstrapError.value = ''
   try {
     let meUser: AuthUser | null = null
     if (hasToken()) {
@@ -317,7 +527,7 @@ async function loadData() {
       }
     }
     appState.value = await fetchBootstrap()
-    if (appState.value) {
+      if (appState.value) {
       const shouldShowLoginReadyHint =
         isRealInitializedAt(appState.value.database.initializedAt) &&
         appState.value.auth.adminExists &&
@@ -349,16 +559,26 @@ async function loadData() {
       mailForm.useTls = appState.value.mail.useTls
       mailForm.useSsl = appState.value.mail.useSsl
       reminderDraft.testMailTo = ''
-      selectedGroupIds.value = (appState.value.notifyGroups ?? []).filter((group) => group.enabled).map((group) => group.id)
+      selectedGroupIds.value = []
+      loginPolicyForm.loginMaxFailed = appState.value.auth.loginMaxFailed || 5
+      loginPolicyForm.loginWindowSec = appState.value.auth.loginWindowSec || 600
       if (currentUser.value) {
         uiSettings.displayName = currentUser.value.name || currentUser.value.username
       }
     }
   } catch (error) {
-    errorMessage.value = error instanceof Error ? error.message : '加载失败'
+    const message = error instanceof Error ? error.message : '加载失败'
+    errorMessage.value = message
+    bootstrapError.value = message
   } finally {
-    loading.value = false
+    if (!silent) {
+      loading.value = false
+    }
   }
+}
+
+function retryLoadData() {
+  void loadData()
 }
 
 async function submitDatabaseConfig() {
@@ -445,6 +665,98 @@ async function handleLogout() {
   successMessage.value = '已退出登录。'
 }
 
+async function loadManagedUsers() {
+  if (!isAdmin.value) {
+    managedUsers.value = []
+    return
+  }
+  const response = await adminListUsers()
+  managedUsers.value = response.users
+}
+
+async function loadAuditLogs() {
+  if (!isAdmin.value) {
+    adminAuditLogs.value = []
+    auditTotal.value = 0
+    return
+  }
+  loadingAudit.value = true
+  try {
+    const offset = (auditPage.value - 1) * auditPageSize.value
+    const response = await adminListAuditLogs(auditPageSize.value, offset)
+    adminAuditLogs.value = response.items
+    auditTotal.value = response.total
+  } finally {
+    loadingAudit.value = false
+  }
+}
+
+function openUserEditor(user: AuthUser) {
+  editingManagedUserId.value = user.id
+  userEditorVisible.value = true
+}
+
+function closeUserEditor() {
+  editingManagedUserId.value = 0
+  userEditorVisible.value = false
+}
+
+async function submitLoginPolicy() {
+  savingLoginPolicy.value = true
+  resetMessages()
+  try {
+    await adminUpdateLoginPolicy({
+      loginMaxFailed: loginPolicyForm.loginMaxFailed,
+      loginWindowSec: loginPolicyForm.loginWindowSec
+    })
+    successMessage.value = '登录限流策略已更新。'
+    await loadAuditLogs()
+    await loadData({ silent: true })
+  } catch (error) {
+    errorMessage.value = normalizeErrorMessage(error, '登录限流策略更新失败')
+  } finally {
+    savingLoginPolicy.value = false
+  }
+}
+
+async function submitResetUserPassword(user: AuthUser) {
+  const password = (userPasswordDraft[user.id] || '').trim()
+  if (!password) {
+    errorMessage.value = '请输入新密码'
+    return
+  }
+  resettingUserPasswordId.value = user.id
+  resetMessages()
+  try {
+    await adminUpdateUserPassword(user.id, password)
+    userPasswordDraft[user.id] = ''
+    successMessage.value = `用户「${user.username}」密码已更新。`
+    await loadAuditLogs()
+  } catch (error) {
+    errorMessage.value = normalizeErrorMessage(error, '修改用户密码失败')
+  } finally {
+    resettingUserPasswordId.value = 0
+  }
+}
+
+async function removeUser(user: AuthUser) {
+  const confirmed = await openConfirm(`确定删除用户「${user.username}」吗？该用户的事件、通知组和配置会一并删除。`, '删除用户')
+  if (!confirmed) return
+  deletingUser.value = true
+  resetMessages()
+  try {
+    await adminDeleteUser(user.id)
+    successMessage.value = `用户「${user.username}」已删除。`
+    await loadData({ silent: true })
+    await loadManagedUsers()
+    await loadAuditLogs()
+  } catch (error) {
+    errorMessage.value = normalizeErrorMessage(error, '删除用户失败')
+  } finally {
+    deletingUser.value = false
+  }
+}
+
 async function submitEvent() {
   creating.value = true
   resetMessages()
@@ -455,20 +767,20 @@ async function submitEvent() {
       offsetMin: item.offsetMin
     }))
     reminderPoints.push({ id: Date.now() + 500, label: '到点提醒', offsetMin: 0 })
-    const customOffset = customReminderOffsetMin()
-    const customLabel = customReminderLabel()
-    if (customOffset > 0 && customLabel) {
-      reminderPoints.push({ id: Date.now() + 99, label: customLabel, offsetMin: customOffset })
-    }
     if (reminderPoints.length === 0) throw new Error('请至少选择一个预提醒时间')
     if (selectedGroupIds.value.length === 0) throw new Error('请至少选择一个通知组')
+    if (reminderDraft.recurrenceType === 'cron' && !reminderDraft.recurrenceExpr.trim()) {
+      throw new Error('Cron 周期模式下请填写表达式')
+    }
 
     const payload = {
       userId: currentUser.value?.id ?? 0,
       title: reminderDraft.title,
       content: reminderDraft.content,
-      eventAt: toApiDateTime(reminderDraft.eventAt),
+      eventAt: reminderDraft.recurrenceType === 'cron' ? '' : toApiDateTime(reminderDraft.eventAt),
       reminderEnabled: true,
+      recurrenceType: reminderDraft.recurrenceType,
+      recurrenceExpr: reminderDraft.recurrenceExpr.trim(),
       reminderPoints,
       boundChannelIds: [],
       boundGroupIds: selectedGroupIds.value
@@ -480,9 +792,21 @@ async function submitEvent() {
     } else {
       await createEvent(payload)
       successMessage.value = '事件已经写入数据库。'
+      clearComposerDraft()
     }
     editingEventId.value = null
-    switchView('list')
+    if (editReturnContext.value) {
+      currentView.value = 'list'
+      listFocus.value = editReturnContext.value.tab
+      if (editReturnContext.value.tab === 'pending') {
+        pendingPage.value = Math.max(1, editReturnContext.value.page)
+      } else {
+        expiredPage.value = Math.max(1, editReturnContext.value.page)
+      }
+      editReturnContext.value = null
+    } else {
+      switchView('list')
+    }
     await loadData()
   } catch (error) {
     errorMessage.value = normalizeErrorMessage(error, '事件创建失败')
@@ -492,30 +816,107 @@ async function submitEvent() {
 }
 
 function beginEdit(event: AppState['events'][number]) {
+  if (currentView.value === 'list') {
+    editReturnContext.value = {
+      tab: listFocus.value,
+      page: listFocus.value === 'pending' ? pendingPage.value : expiredPage.value
+    }
+  } else {
+    editReturnContext.value = null
+  }
   switchView('composer')
   editingEventId.value = event.id
   reminderDraft.title = event.title
   reminderDraft.content = event.content
   reminderDraft.eventAt = toDateTimeLocal(event.eventAt)
+  reminderDraft.recurrenceType = event.recurrenceType || 'once'
+  reminderDraft.recurrenceExpr = event.recurrenceExpr || ''
+  if (reminderDraft.recurrenceType === 'cron' && reminderDraft.recurrenceExpr) {
+    syncCronDraftFromExpr(reminderDraft.recurrenceExpr)
+  }
   selectedGroupIds.value = [...(event.boundGroupIds ?? [])]
   reminderOptions.forEach((option) => {
     option.selected = event.reminderPoints.some((point) => point.offsetMin === option.offsetMin)
   })
-  const customPoint = event.reminderPoints.find((point) => !reminderOptions.some((option) => option.offsetMin === point.offsetMin))
-  if (customPoint) {
-    if (customPoint.offsetMin % 1440 === 0) {
-      reminderDraft.customUnit = 'day'
-      reminderDraft.customValue = customPoint.offsetMin / 1440
-    } else if (customPoint.offsetMin % 60 === 0) {
-      reminderDraft.customUnit = 'hour'
-      reminderDraft.customValue = customPoint.offsetMin / 60
+}
+
+function cancelEdit() {
+  editingEventId.value = null
+  if (editReturnContext.value) {
+    currentView.value = 'list'
+    listFocus.value = editReturnContext.value.tab
+    if (editReturnContext.value.tab === 'pending') {
+      pendingPage.value = Math.max(1, editReturnContext.value.page)
     } else {
-      reminderDraft.customUnit = 'minute'
-      reminderDraft.customValue = customPoint.offsetMin
+      expiredPage.value = Math.max(1, editReturnContext.value.page)
     }
+    editReturnContext.value = null
+  }
+}
+
+function toggleEventSelection(eventId: number) {
+  selectedEventIds.value = selectedEventIds.value.includes(eventId)
+    ? selectedEventIds.value.filter((id) => id !== eventId)
+    : [...selectedEventIds.value, eventId]
+}
+
+function toggleCurrentPageSelection() {
+  const pageIDs = currentPageEvents.value.map((item) => item.id)
+  if (pageIDs.length === 0) return
+  if (allCurrentPageSelected.value) {
+    selectedEventIds.value = selectedEventIds.value.filter((id) => !pageIDs.includes(id))
   } else {
-    reminderDraft.customUnit = 'minute'
-    reminderDraft.customValue = 0
+    const merged = new Set([...selectedEventIds.value, ...pageIDs])
+    selectedEventIds.value = Array.from(merged)
+  }
+}
+
+async function batchDeleteSelectedEvents() {
+  if (selectedEventIds.value.length === 0) return
+  const ok = await openConfirm(`确定删除选中的 ${selectedEventIds.value.length} 个事件吗？`, '批量删除')
+  if (!ok) return
+  resetMessages()
+  const ids = [...selectedEventIds.value]
+  try {
+    for (const id of ids) {
+      await deleteEvent(id)
+    }
+    selectedEventIds.value = []
+    successMessage.value = `已删除 ${ids.length} 个事件。`
+    await loadData({ silent: true })
+  } catch (error) {
+    errorMessage.value = normalizeErrorMessage(error, '批量删除失败')
+  }
+}
+
+async function batchUpdateReminderEnabled(enabled: boolean) {
+  if (selectedEventIds.value.length === 0) return
+  resetMessages()
+  try {
+    const eventMap = new Map(events.value.map((item) => [item.id, item]))
+    let count = 0
+    for (const id of selectedEventIds.value) {
+      const event = eventMap.get(id)
+      if (!event) continue
+      await updateEvent(id, {
+        userId: event.userId,
+        title: event.title,
+        content: event.content,
+        eventAt: event.eventAt,
+        reminderEnabled: enabled,
+        recurrenceType: event.recurrenceType,
+        recurrenceExpr: event.recurrenceExpr || '',
+        reminderPoints: event.reminderPoints,
+        boundChannelIds: event.boundChannelIds,
+        boundGroupIds: event.boundGroupIds
+      })
+      count++
+    }
+    selectedEventIds.value = []
+    successMessage.value = enabled ? `已启用 ${count} 个事件提醒。` : `已停用 ${count} 个事件提醒。`
+    await loadData({ silent: true })
+  } catch (error) {
+    errorMessage.value = normalizeErrorMessage(error, '批量更新提醒失败')
   }
 }
 
@@ -578,8 +979,8 @@ async function runDispatch() {
   resetMessages()
   try {
     const response = await dispatchReminders()
-    successMessage.value = `扫描完成：触发 ${response.result.triggered}，成功 ${response.result.sent}，失败 ${response.result.failed}，跳过 ${response.result.skipped}。`
-    await loadData()
+    successMessage.value = `扫描完成：触发 ${response.result.triggered}，成功 ${response.result.sent}，重试中 ${response.result.retried}，失败 ${response.result.failed}，跳过 ${response.result.skipped}。`
+    await loadData({ silent: true })
   } catch (error) {
     errorMessage.value = normalizeErrorMessage(error, '提醒扫描失败')
   } finally {
@@ -665,6 +1066,8 @@ function syncRouteFromState(replace = false) {
   let hash = '#/composer'
   if (currentView.value === 'list') {
     hash = `#/list?tab=${listFocus.value}`
+  } else if (currentView.value === 'users') {
+    hash = '#/users'
   } else if (currentView.value === 'settings') {
     hash = '#/settings'
   } else if (currentView.value === 'notify') {
@@ -710,6 +1113,16 @@ async function applyRouteToState() {
     currentView.value = 'settings'
     notifyEditorVisible.value = false
     resetGroupForm()
+  } else if (path === '/users') {
+    currentView.value = 'users'
+    notifyEditorVisible.value = false
+    resetGroupForm()
+    if (isAdmin.value) {
+      await loadManagedUsers()
+    } else {
+      currentView.value = 'composer'
+      syncRouteFromState(true)
+    }
   } else if (path === '/notify') {
     currentView.value = 'notify'
     notifyEditorVisible.value = false
@@ -754,7 +1167,7 @@ async function submitNotifyGroup() {
     successMessage.value = '通知组已保存。'
     notifyEditorVisible.value = false
     resetGroupForm()
-    await loadData()
+    await loadData({ silent: true })
     currentView.value = 'notify'
   } catch (error) {
     errorMessage.value = normalizeErrorMessage(error, '通知组保存失败')
@@ -775,7 +1188,7 @@ async function removeGroup(id: number) {
       notifyEditorVisible.value = false
       resetGroupForm()
     }
-    await loadData()
+    await loadData({ silent: true })
   } catch (error) {
     errorMessage.value = normalizeErrorMessage(error, '通知组删除失败')
   }
@@ -812,6 +1225,9 @@ async function testGroupMember(member: { type: 'email' | 'dingtalk_webhook'; tar
 onMounted(async () => {
   loadUiSettings()
   await loadData()
+  restoreComposerDraft()
+  await loadManagedUsers()
+  await loadAuditLogs()
   applyRouteToState()
   window.addEventListener('hashchange', applyRouteToState)
 })
@@ -829,6 +1245,103 @@ watch(listFocus, () => {
     syncRouteFromState()
   }
 })
+
+watch(listPageSize, () => {
+  pendingPage.value = 1
+  expiredPage.value = 1
+  if (editReturnContext.value) {
+    editReturnContext.value.page = 1
+  }
+})
+
+watch([listQuery, listSort], () => {
+  pendingPage.value = 1
+  expiredPage.value = 1
+  selectedEventIds.value = []
+})
+
+watch(userPageSize, () => {
+  userPage.value = 1
+})
+
+watch(auditPageSize, () => {
+  auditPage.value = 1
+})
+
+watch(pendingTotalPages, (total) => {
+  if (pendingPage.value > total) pendingPage.value = total
+})
+
+watch(expiredTotalPages, (total) => {
+  if (expiredPage.value > total) expiredPage.value = total
+})
+
+watch(userTotalPages, (total) => {
+  if (userPage.value > total) userPage.value = total
+})
+
+watch(auditTotalPages, (total) => {
+  if (auditPage.value > total) auditPage.value = total
+})
+
+watch(listFocus, () => {
+  selectedEventIds.value = []
+})
+
+watch(
+  () => reminderDraft.recurrenceType,
+  (type) => {
+    if (type === 'cron') {
+      reminderDraft.eventAt = nowDateTimeLocal()
+      if (!reminderDraft.recurrenceExpr.trim()) {
+        syncCronExprFromDraft()
+      } else {
+        syncCronDraftFromExpr(reminderDraft.recurrenceExpr)
+      }
+      return
+    }
+    reminderDraft.recurrenceExpr = ''
+  }
+)
+
+watch(
+  () => [cronDraft.minute, cronDraft.hour, cronDraft.day, cronDraft.month, cronDraft.weekday],
+  () => {
+    if (reminderDraft.recurrenceType === 'cron') {
+      syncCronExprFromDraft()
+    }
+  }
+)
+
+watch([currentView, isAdmin], async ([view, admin]) => {
+  if ((view === 'settings' || view === 'users') && admin) {
+    await loadManagedUsers()
+    await loadAuditLogs()
+  }
+})
+
+watch([auditPage, auditPageSize, currentView], async () => {
+  if (currentView.value === 'users' && isAdmin.value) {
+    await loadAuditLogs()
+  }
+})
+
+watch(
+  () => ({
+    title: reminderDraft.title,
+    content: reminderDraft.content,
+    eventAt: reminderDraft.eventAt,
+    recurrenceType: reminderDraft.recurrenceType,
+    recurrenceExpr: reminderDraft.recurrenceExpr,
+    offsets: reminderOptions.map((item) => ({ offset: item.offsetMin, selected: item.selected })),
+    groupIDs: [...selectedGroupIds.value]
+  }),
+  () => {
+    if (!loggedIn.value || editingEventId.value) return
+    saveComposerDraft()
+  },
+  { deep: true }
+)
 </script>
 
 <template>
@@ -841,6 +1354,18 @@ watch(listFocus, () => {
         <p class="eyebrow">WaitWhat</p>
         <h1>正在准备你的提醒工作台</h1>
         <p class="muted-copy">加载数据库状态、用户体系和提醒数据中...</p>
+      </div>
+    </div>
+
+    <div v-else-if="backendUnavailable" class="center-shell">
+      <div class="auth-card">
+        <p class="eyebrow">Backend</p>
+        <h1>后端服务暂不可用</h1>
+        <p class="muted-copy">当前无法连接到 API（通常是后端未启动或端口未就绪），所以不会进入数据库初始化流程。</p>
+        <div class="form-actions top-gap">
+          <button class="primary-btn" @click="retryLoadData">重新连接</button>
+        </div>
+        <p class="status-text error" v-if="bootstrapError">{{ bootstrapError }}</p>
       </div>
     </div>
 
@@ -906,23 +1431,26 @@ watch(listFocus, () => {
     </div>
 
     <div v-else-if="!loggedIn" class="center-shell">
-      <div class="auth-card">
-        <p class="eyebrow">Welcome</p>
-        <h1>{{ uiSettings.projectName }}</h1>
-        <p v-if="showLoginReadyHint" class="muted-copy">管理员已设置完成。现在可以登录，或者注册普通用户再进入工作台。</p>
-        <div class="pill-switch">
+      <div class="auth-card login-modal">
+        <div class="login-head">
+          <p class="eyebrow">Welcome</p>
+          <h2>欢迎回来</h2>
+          <p class="muted-copy">{{ showLoginReadyHint ? '管理员已设置完成，请登录继续。' : '请登录你的账号' }}</p>
+        </div>
+        <div class="pill-switch login-switch">
           <button :class="['pill-btn', authMode === 'login' && 'active']" @click="authMode = 'login'">登录</button>
           <button :class="['pill-btn', authMode === 'register' && 'active']" @click="authMode = 'register'">注册</button>
         </div>
-        <div class="form-grid">
-          <label class="field"><span>用户名</span><input v-model="authForm.username" /></label>
-          <label class="field"><span>密码</span><input v-model="authForm.password" type="password" /></label>
-          <label v-if="authMode === 'register'" class="field"><span>昵称</span><input v-model="authForm.name" /></label>
-          <label v-if="authMode === 'register'" class="field"><span>邮箱</span><input v-model="authForm.email" /></label>
+        <div class="login-form">
+          <input v-model="authForm.username" placeholder="用户名" />
+          <input v-model="authForm.password" type="password" placeholder="密码" />
+          <input v-if="authMode === 'register'" v-model="authForm.name" placeholder="昵称（注册必填）" />
+          <input v-if="authMode === 'register'" v-model="authForm.email" placeholder="邮箱（注册必填）" />
         </div>
-        <div class="form-actions">
-          <button class="primary-btn" :disabled="authSubmitting" @click="submitAuth">{{ authSubmitting ? '提交中...' : authMode === 'login' ? '登录' : '注册并登录' }}</button>
+        <div class="form-actions login-actions">
+          <button class="primary-btn login-submit" :disabled="authSubmitting" @click="submitAuth">{{ authSubmitting ? '提交中...' : authMode === 'login' ? '立即登录' : '注册并登录' }}</button>
         </div>
+        <p class="login-footnote" v-if="authMode === 'login'">忘记密码功能暂未开放</p>
         <p class="status-text success" v-if="successMessage">{{ successMessage }}</p>
         <p class="status-text error" v-if="errorMessage">{{ errorMessage }}</p>
       </div>
@@ -941,6 +1469,7 @@ watch(listFocus, () => {
           <button :class="['nav-btn', currentView === 'composer' && 'active']" @click="switchView('composer')">创建备忘录</button>
           <button :class="['nav-btn', currentView === 'list' && 'active']" @click="switchView('list')">备忘录列表</button>
           <button :class="['nav-btn', currentView === 'notify' && 'active']" @click="switchView('notify')">通知相关</button>
+          <button v-if="isAdmin" :class="['nav-btn', currentView === 'users' && 'active']" @click="switchView('users')">用户管理</button>
           <button :class="['nav-btn', currentView === 'settings' && 'active']" @click="switchView('settings')">设置</button>
         </nav>
         <div class="account-box">
@@ -975,18 +1504,77 @@ watch(listFocus, () => {
               <div class="editor-card">
                 <label class="field"><span>标题</span><input v-model="reminderDraft.title" /></label>
                 <label class="field"><span>内容</span><textarea v-model="reminderDraft.content" rows="5"></textarea></label>
-                <label class="field"><span>事件时间</span><input v-model="reminderDraft.eventAt" type="datetime-local" /></label>
+                <label class="field">
+                  <span>事件时间 <small v-if="reminderDraft.recurrenceType === 'cron'" class="field-lock-tag">Cron 中不可用</small></span>
+                  <input
+                    v-model="reminderDraft.eventAt"
+                    type="datetime-local"
+                    :disabled="reminderDraft.recurrenceType === 'cron'"
+                    :class="{ 'is-disabled': reminderDraft.recurrenceType === 'cron' }"
+                  />
+                  <small v-if="reminderDraft.recurrenceType === 'cron'" class="field-hint">Cron 模式不需要手动设置事件时间。</small>
+                </label>
                 <div class="subsection">
                   <span class="subsection-title">预提醒时间</span>
                   <div class="selectable-grid">
                     <button v-for="option in reminderOptions" :key="option.key" type="button" :class="['select-chip', option.selected && 'active']" @click="option.selected = !option.selected">{{ option.label }}</button>
                   </div>
-                  <div class="custom-reminder-row">
-                    <label class="field compact-field"><span>自定义提前</span><input v-model.number="reminderDraft.customValue" type="number" min="1" /></label>
-                    <label class="field compact-field"><span>单位</span><select v-model="reminderDraft.customUnit"><option value="minute">分钟</option><option value="hour">小时</option><option value="day">天</option></select></label>
+                  <div class="custom-reminder-tools">
+                    <label class="field compact-field">
+                      <span>自定义预提醒</span>
+                      <input v-model.number="customReminderDraft.value" type="number" min="1" placeholder="例如 45" />
+                    </label>
+                    <label class="field compact-field">
+                      <span>单位</span>
+                      <select v-model="customReminderDraft.unit">
+                        <option value="minute">分钟</option>
+                        <option value="hour">小时</option>
+                        <option value="day">天</option>
+                      </select>
+                    </label>
+                    <button type="button" class="secondary-btn add-reminder-btn" @click="addCustomReminderOption">添加预提醒</button>
                   </div>
                 </div>
                 <div class="subsection">
+                  <span class="subsection-title">提醒周期</span>
+                  <div class="custom-reminder-row">
+                    <label class="field compact-field">
+                      <span>周期类型</span>
+                      <select v-model="reminderDraft.recurrenceType">
+                        <option value="once">一次性</option>
+                        <option value="daily">每天</option>
+                        <option value="workday">工作日</option>
+                        <option value="cron">Cron 自定义</option>
+                      </select>
+                    </label>
+                    <div class="cron-editor" v-if="reminderDraft.recurrenceType === 'cron'">
+                      <div class="cron-grid">
+                        <label class="field compact-field">
+                          <span>分</span>
+                          <input v-model="cronDraft.minute" placeholder="0" />
+                        </label>
+                        <label class="field compact-field">
+                          <span>时</span>
+                          <input v-model="cronDraft.hour" placeholder="9" />
+                        </label>
+                        <label class="field compact-field">
+                          <span>日</span>
+                          <input v-model="cronDraft.day" placeholder="*" />
+                        </label>
+                        <label class="field compact-field">
+                          <span>月</span>
+                          <input v-model="cronDraft.month" placeholder="*" />
+                        </label>
+                        <label class="field compact-field">
+                          <span>周</span>
+                          <input v-model="cronDraft.weekday" placeholder="1-5" />
+                        </label>
+                      </div>
+                      <small class="field-hint">支持 `*`、`*/n`、区间（如 `1-5`）、枚举（如 `1,3,5`）。格式：分 时 日 月 周。</small>
+                    </div>
+                  </div>
+                </div>
+                <div class="subsection group-picker">
                   <span class="subsection-title">提醒对象（通知组）</span>
                   <div class="selectable-grid">
                     <button
@@ -998,15 +1586,16 @@ watch(listFocus, () => {
                     >{{ group.name }}</button>
                   </div>
                 </div>
-                <div class="form-actions">
+                <div class="form-actions composer-actions">
                   <button class="primary-btn" :disabled="creating" @click="submitEvent">{{ creating ? '处理中...' : editingEventId ? '保存修改' : '创建这个事件' }}</button>
-                  <button v-if="editingEventId" class="secondary-btn" @click="editingEventId = null">取消编辑</button>
+                  <button v-if="editingEventId" class="secondary-btn" @click="cancelEdit">取消编辑</button>
                 </div>
               </div>
 
-              <div class="preview-board">
+                <div class="preview-board">
                 <div class="preview-summary"><p class="section-label">Preview</p><h3>{{ reminderDraft.title }}</h3><p>{{ reminderDraft.content }}</p></div>
-                <div class="info-card"><span>事件时间</span><strong>{{ reminderDraft.eventAt || '请选择时间' }}</strong></div>
+                <div class="info-card"><span>事件时间</span><strong>{{ composerEventAtText }}</strong></div>
+                <div class="info-card"><span>提醒周期</span><strong>{{ recurrenceSummary }}</strong></div>
                 <div class="subsection"><span class="subsection-title">本次将生成的提醒点</span><div class="tag-row"><span class="mini-tag" v-for="point in selectedReminderSummary" :key="point">{{ point }}</span></div></div>
                 <div class="subsection"><span class="subsection-title">本次选中的通知组</span><div class="tag-row"><span class="mini-tag" v-for="group in selectedGroups" :key="group.id">{{ group.name }}</span></div></div>
               </div>
@@ -1019,47 +1608,110 @@ watch(listFocus, () => {
               <button :class="['pill-btn', listFocus === 'pending' && 'active']" @click="listFocus = 'pending'">待提醒</button>
               <button :class="['pill-btn', listFocus === 'expired' && 'active']" @click="listFocus = 'expired'">已过期</button>
             </div>
+            <div class="list-tools">
+              <input v-model="listQuery" class="search-input" placeholder="搜索标题或内容" />
+              <select v-model="listSort" class="list-sort-select">
+                <option value="time_asc">按时间（近 → 远）</option>
+                <option value="time_desc">按时间（远 → 近）</option>
+                <option value="title_asc">按标题（A → Z）</option>
+              </select>
+            </div>
+            <div class="batch-actions">
+              <label class="checkbox-line"><input type="checkbox" :checked="allCurrentPageSelected" @change="toggleCurrentPageSelection" /><span>本页全选</span></label>
+              <span class="batch-count">已选 {{ selectedEventIds.length }} 项</span>
+              <button class="secondary-btn" :disabled="selectedEventIds.length === 0" @click="batchUpdateReminderEnabled(true)">批量启用提醒</button>
+              <button class="secondary-btn" :disabled="selectedEventIds.length === 0" @click="batchUpdateReminderEnabled(false)">批量停用提醒</button>
+              <button class="danger-btn" :disabled="selectedEventIds.length === 0" @click="batchDeleteSelectedEvents">批量删除</button>
+            </div>
             <div class="memo-lanes top-gap">
               <section v-if="listFocus === 'pending'" :class="['subpanel', 'memo-lane', 'active-lane']">
                 <div class="lane-head">
                   <h3>待提醒</h3>
-                  <span class="lane-count">{{ pendingEvents.length }}</span>
+                  <span class="lane-count">{{ filteredPendingEvents.length }}</span>
                 </div>
-                <div v-if="pendingEvents.length === 0" class="lane-empty">暂无待提醒备忘录。</div>
-                <div v-else class="list-stack">
-                  <article class="memo-card" v-for="event in pendingEvents" :key="event.id">
-                    <div class="memo-header"><div><h3>{{ event.title }}</h3><p>{{ event.content }}</p></div><span class="countdown-badge">{{ event.countdownLabel }}</span></div>
-                    <div class="meta-row"><span>事件时间：{{ new Date(event.eventAt).toLocaleString() }}</span><span>状态：{{ event.status }}</span></div>
-                    <div class="tag-row"><span class="mini-tag" v-for="point in event.reminderPoints" :key="point.id">{{ point.label }}</span></div>
+                <div v-if="filteredPendingEvents.length === 0" class="lane-empty">暂无待提醒备忘录。</div>
+                <div v-else class="memo-list-scroll">
+                  <div class="memo-card-grid">
+                  <article class="memo-mini-card" v-for="event in pagedPendingEvents" :key="event.id" @click="beginEdit(event)">
+                    <label class="checkbox-line mini-select" @click.stop>
+                      <input type="checkbox" :checked="selectedEventIds.includes(event.id)" @change="toggleEventSelection(event.id)" />
+                      <span>选择</span>
+                    </label>
+                    <div class="memo-header compact">
+                      <h3>{{ event.title }}</h3>
+                    </div>
+                    <div class="mini-meta">提醒时间：{{ new Date(event.eventAt).toLocaleString() }}</div>
                     <div class="form-actions top-gap">
-                      <button class="secondary-btn" @click="beginEdit(event)">编辑</button>
-                      <button class="danger-btn" @click="removeEvent(event.id)">删除</button>
+                      <button class="secondary-btn" @click.stop="beginEdit(event)">编辑</button>
+                      <button class="danger-btn" @click.stop="removeEvent(event.id)">删除</button>
                     </div>
                   </article>
+                  </div>
+                </div>
+                <div v-if="filteredPendingEvents.length > 0" class="pager-row">
+                  <div class="pager-left">
+                    <span>每页显示</span>
+                    <select v-model.number="listPageSize">
+                      <option :value="12">12</option>
+                      <option :value="30">30</option>
+                      <option :value="50">50</option>
+                      <option :value="100">100</option>
+                    </select>
+                    <span>条</span>
+                  </div>
+                  <div class="pager-right">
+                    <button class="secondary-btn" :disabled="pendingPage <= 1" @click="pendingPage -= 1">上一页</button>
+                    <span>{{ pendingPage }} / {{ pendingTotalPages }}</span>
+                    <button class="secondary-btn" :disabled="pendingPage >= pendingTotalPages" @click="pendingPage += 1">下一页</button>
+                  </div>
                 </div>
               </section>
               <section v-else :class="['subpanel', 'memo-lane', 'active-lane']">
                 <div class="lane-head">
                   <h3>已过期</h3>
-                  <span class="lane-count">{{ expiredEvents.length }}</span>
+                  <span class="lane-count">{{ filteredExpiredEvents.length }}</span>
                 </div>
-                <div v-if="expiredEvents.length === 0" class="lane-empty">暂无过期备忘录。</div>
-                <div v-else class="list-stack">
-                  <article class="memo-card" v-for="event in expiredEvents" :key="event.id">
-                    <div class="memo-header"><div><h3>{{ event.title }}</h3><p>{{ event.content }}</p></div><span class="countdown-badge">{{ event.countdownLabel }}</span></div>
-                    <div class="meta-row"><span>事件时间：{{ new Date(event.eventAt).toLocaleString() }}</span><span>状态：{{ event.status }}</span></div>
-                    <div class="tag-row"><span class="mini-tag" v-for="point in event.reminderPoints" :key="point.id">{{ point.label }}</span></div>
+                <div v-if="filteredExpiredEvents.length === 0" class="lane-empty">暂无过期备忘录。</div>
+                <div v-else class="memo-list-scroll">
+                  <div class="memo-card-grid">
+                  <article class="memo-mini-card" v-for="event in pagedExpiredEvents" :key="event.id" @click="beginEdit(event)">
+                    <label class="checkbox-line mini-select" @click.stop>
+                      <input type="checkbox" :checked="selectedEventIds.includes(event.id)" @change="toggleEventSelection(event.id)" />
+                      <span>选择</span>
+                    </label>
+                    <div class="memo-header compact">
+                      <h3>{{ event.title }}</h3>
+                    </div>
+                    <div class="mini-meta">提醒时间：{{ new Date(event.eventAt).toLocaleString() }}</div>
                     <div class="form-actions top-gap">
-                      <button class="secondary-btn" @click="beginEdit(event)">编辑</button>
-                      <button class="danger-btn" @click="removeEvent(event.id)">删除</button>
+                      <button class="secondary-btn" @click.stop="beginEdit(event)">编辑</button>
+                      <button class="danger-btn" @click.stop="removeEvent(event.id)">删除</button>
                     </div>
                   </article>
+                  </div>
+                </div>
+                <div v-if="filteredExpiredEvents.length > 0" class="pager-row">
+                  <div class="pager-left">
+                    <span>每页显示</span>
+                    <select v-model.number="listPageSize">
+                      <option :value="12">12</option>
+                      <option :value="30">30</option>
+                      <option :value="50">50</option>
+                      <option :value="100">100</option>
+                    </select>
+                    <span>条</span>
+                  </div>
+                  <div class="pager-right">
+                    <button class="secondary-btn" :disabled="expiredPage <= 1" @click="expiredPage -= 1">上一页</button>
+                    <span>{{ expiredPage }} / {{ expiredTotalPages }}</span>
+                    <button class="secondary-btn" :disabled="expiredPage >= expiredTotalPages" @click="expiredPage += 1">下一页</button>
+                  </div>
                 </div>
               </section>
             </div>
             <div class="dual-grid">
-              <section class="subpanel"><div class="panel-head"><div><p class="section-label">Tasks</p><h3>提醒任务</h3></div></div><div class="log-list"><div class="log-item" v-for="task in tasks.slice(0, 8)" :key="task.id"><div><strong>{{ task.channelType }} · 任务 #{{ task.id }}</strong><p>计划：{{ new Date(task.scheduledAt).toLocaleString() }}</p></div><div class="log-side"><span :class="['log-status', task.status === 'sent' ? 'success' : task.status === 'failed' ? 'failed' : 'pending']">{{ task.status }}</span><small>{{ task.lastError || '等待调度或已成功投递' }}</small></div></div></div></section>
-              <section class="subpanel"><div class="panel-head"><div><p class="section-label">Logs</p><h3>通知日志</h3></div></div><div class="log-list"><div class="log-item" v-for="log in logs.slice(0, 8)" :key="log.id"><div><strong>{{ log.channelName }}</strong><p>{{ log.message }}</p></div><div class="log-side"><span :class="['log-status', log.status]">{{ log.status }}</span><small>{{ new Date(log.triggeredAt).toLocaleString() }}</small></div></div></div></section>
+              <section class="subpanel log-scroll-panel"><div class="panel-head"><div><p class="section-label">Tasks</p><h3>提醒任务</h3></div></div><div class="log-list"><div class="log-item" v-for="task in tasks.slice(0, 8)" :key="task.id"><div><strong>{{ task.channelType }} · 任务 #{{ task.id }}</strong><p>计划：{{ new Date(task.scheduledAt).toLocaleString() }}</p></div><div class="log-side"><span :class="['log-status', task.status === 'sent' ? 'success' : task.status === 'failed' ? 'failed' : task.status === 'processing' ? 'processing' : 'pending']">{{ task.status }}</span><small>{{ task.lastError || '等待调度或已成功投递' }}</small></div></div></div></section>
+              <section class="subpanel log-scroll-panel"><div class="panel-head"><div><p class="section-label">Logs</p><h3>通知日志</h3></div></div><div class="log-list"><div class="log-item" v-for="log in logs.slice(0, 8)" :key="log.id"><div><strong>{{ log.channelName }}</strong><p>{{ log.message }}</p></div><div class="log-side"><span :class="['log-status', log.status]">{{ log.status }}</span><small>{{ new Date(log.triggeredAt).toLocaleString() }}</small></div></div></div></section>
             </div>
           </section>
 
@@ -1140,6 +1792,125 @@ watch(listFocus, () => {
             </section>
           </section>
 
+          <section v-else-if="currentView === 'users'" class="content-panel glass-panel">
+            <div class="panel-head align-center">
+              <div><p class="section-label">Admin</p><h2>用户管理</h2></div>
+            </div>
+            <section class="subpanel">
+              <div class="panel-head"><div><p class="section-label">Security</p><h3>登录限流设置</h3></div></div>
+              <div class="form-grid">
+                <label class="field">
+                  <span>登录失败阈值</span>
+                  <input v-model.number="loginPolicyForm.loginMaxFailed" type="number" min="1" max="20" />
+                </label>
+                <label class="field">
+                  <span>限流窗口（秒）</span>
+                  <input v-model.number="loginPolicyForm.loginWindowSec" type="number" min="30" max="3600" />
+                </label>
+              </div>
+              <div class="form-actions">
+                <button class="primary-btn" :disabled="savingLoginPolicy" @click="submitLoginPolicy">
+                  {{ savingLoginPolicy ? '保存中...' : '保存登录限流设置' }}
+                </button>
+              </div>
+            </section>
+            <section class="subpanel top-gap">
+              <section v-if="!userEditorVisible">
+                <div class="panel-head align-center">
+                  <div><p class="section-label">Users</p><h3>账号列表</h3></div>
+                  <span class="lane-count">{{ managedUsers.length }}</span>
+                </div>
+                <div class="user-list-scroll" v-if="managedUsers.length > 0">
+                  <div class="user-admin-grid">
+                    <article class="user-admin-card clickable" v-for="user in pagedManagedUsers" :key="user.id" @click="openUserEditor(user)">
+                      <div class="user-admin-head">
+                        <div>
+                          <strong>{{ user.name || user.username }}</strong>
+                          <p>{{ user.username }} · {{ user.role === 'admin' ? '管理员' : '普通用户' }}</p>
+                        </div>
+                      </div>
+                      <div class="mini-meta">点击进入编辑</div>
+                    </article>
+                  </div>
+                </div>
+                <div v-else class="lane-empty">暂无可管理用户。</div>
+                <div class="pager-row" v-if="managedUsers.length > 0">
+                  <div class="pager-left">
+                    <span>每页显示</span>
+                    <select v-model.number="userPageSize">
+                      <option :value="12">12</option>
+                      <option :value="30">30</option>
+                      <option :value="50">50</option>
+                      <option :value="100">100</option>
+                    </select>
+                    <span>条</span>
+                  </div>
+                  <div class="pager-right">
+                    <button class="secondary-btn" :disabled="userPage <= 1" @click="userPage -= 1">上一页</button>
+                    <span>{{ userPage }} / {{ userTotalPages }}</span>
+                    <button class="secondary-btn" :disabled="userPage >= userTotalPages" @click="userPage += 1">下一页</button>
+                  </div>
+                </div>
+              </section>
+              <section v-else class="subpanel user-editor-panel">
+                <div class="panel-head align-center">
+                  <div><p class="section-label">User Editor</p><h3>{{ editingManagedUser?.username }}</h3></div>
+                  <button class="secondary-btn" @click="closeUserEditor">返回列表</button>
+                </div>
+                <div v-if="editingManagedUser" class="form-grid">
+                  <label class="field">
+                    <span>新密码</span>
+                    <input v-model="userPasswordDraft[editingManagedUser.id]" type="password" :placeholder="`为 ${editingManagedUser.username} 设置新密码`" />
+                  </label>
+                </div>
+                <div v-if="editingManagedUser" class="form-actions">
+                  <button class="secondary-btn" :disabled="resettingUserPasswordId > 0 || !userPasswordDraft[editingManagedUser.id]" @click="submitResetUserPassword(editingManagedUser)">
+                    {{ resettingUserPasswordId === editingManagedUser.id ? '更新中...' : '修改密码' }}
+                  </button>
+                  <button class="danger-btn" :disabled="deletingUser || editingManagedUser.id === currentUser?.id || editingManagedUser.role === 'admin'" @click="removeUser(editingManagedUser)">
+                    {{ deletingUser ? '删除中...' : editingManagedUser.id === currentUser?.id ? '当前账号' : editingManagedUser.role === 'admin' ? '管理员不可删' : '删除用户' }}
+                  </button>
+                </div>
+              </section>
+            </section>
+            <section class="subpanel top-gap">
+              <div class="panel-head align-center">
+                <div><p class="section-label">Audit</p><h3>管理员操作日志</h3></div>
+                <span class="lane-count">{{ auditTotal }}</span>
+              </div>
+              <div class="log-list audit-list" v-if="adminAuditLogs.length > 0">
+                <div class="log-item" v-for="item in adminAuditLogs" :key="item.id">
+                  <div>
+                    <strong>{{ item.actorUsername }} · {{ item.action }}</strong>
+                    <p>{{ item.detail }}（目标：{{ item.targetUsername || '-' }}）</p>
+                  </div>
+                  <div class="log-side">
+                    <span class="log-status pending">audit</span>
+                    <small>{{ new Date(item.createdAt).toLocaleString() }}</small>
+                  </div>
+                </div>
+              </div>
+              <div v-else class="lane-empty">{{ loadingAudit ? '加载中...' : '暂无审计日志。' }}</div>
+              <div class="pager-row" v-if="auditTotal > 0">
+                <div class="pager-left">
+                  <span>每页显示</span>
+                  <select v-model.number="auditPageSize">
+                    <option :value="12">12</option>
+                    <option :value="30">30</option>
+                    <option :value="50">50</option>
+                    <option :value="100">100</option>
+                  </select>
+                  <span>条</span>
+                </div>
+                <div class="pager-right">
+                  <button class="secondary-btn" :disabled="auditPage <= 1 || loadingAudit" @click="auditPage -= 1">上一页</button>
+                  <span>{{ auditPage }} / {{ auditTotalPages }}</span>
+                  <button class="secondary-btn" :disabled="auditPage >= auditTotalPages || loadingAudit" @click="auditPage += 1">下一页</button>
+                </div>
+              </div>
+            </section>
+          </section>
+
           <section v-else class="content-panel glass-panel">
             <div class="panel-head"><div><p class="section-label">Workspace Settings</p><h2>系统设置与显示配置</h2></div></div>
             <div class="settings-stack">
@@ -1170,6 +1941,7 @@ watch(listFocus, () => {
                 </div>
                 <div class="form-actions"><button class="primary-btn" :disabled="savingUi" @click="saveUiSettings">{{ savingUi ? '保存中...' : '保存界面设置' }}</button></div>
               </section>
+
               <section class="subpanel">
                 <div class="panel-head"><div><p class="section-label">SMTP</p><h3>邮件发送配置</h3></div></div>
                 <button class="collapse-btn" @click="showMailConfig = !showMailConfig">{{ showMailConfig ? '收起' : '展开' }}</button>

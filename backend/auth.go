@@ -4,6 +4,7 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
@@ -67,20 +68,92 @@ func hashPassword(password string) (string, error) {
 	if _, err := rand.Read(salt); err != nil {
 		return "", err
 	}
-	sum := sha256.Sum256(append(salt, []byte(password)...))
-	return fmt.Sprintf("%s:%s", hex.EncodeToString(salt), hex.EncodeToString(sum[:])), nil
+	iterations := 120000
+	derived := pbkdf2SHA256([]byte(password), salt, iterations, 32)
+	return fmt.Sprintf("pbkdf2$sha256$%d$%s$%s", iterations, hex.EncodeToString(salt), hex.EncodeToString(derived)), nil
 }
 
 func verifyPassword(stored, password string) bool {
+	ok, _ := verifyPasswordWithScheme(stored, password)
+	return ok
+}
+
+func needsPasswordRehash(stored string) bool {
+	_, scheme := verifyPasswordWithScheme(stored, "dummy-never-match")
+	return scheme != "pbkdf2"
+}
+
+func verifyPasswordWithScheme(stored, password string) (bool, string) {
+	if strings.HasPrefix(stored, "pbkdf2$sha256$") {
+		parts := strings.Split(stored, "$")
+		if len(parts) != 5 {
+			return false, "pbkdf2"
+		}
+		iterations, err := strconv.Atoi(parts[2])
+		if err != nil || iterations < 10000 {
+			return false, "pbkdf2"
+		}
+		salt, err := hex.DecodeString(parts[3])
+		if err != nil {
+			return false, "pbkdf2"
+		}
+		expected, err := hex.DecodeString(parts[4])
+		if err != nil {
+			return false, "pbkdf2"
+		}
+		derived := pbkdf2SHA256([]byte(password), salt, iterations, len(expected))
+		return subtle.ConstantTimeCompare(expected, derived) == 1, "pbkdf2"
+	}
+
+	// Legacy format: saltHex:sha256Hex
 	parts := strings.Split(stored, ":")
 	if len(parts) != 2 {
-		return false
+		return false, "unknown"
 	}
 	salt, err := hex.DecodeString(parts[0])
 	if err != nil {
-		return false
+		return false, "legacy"
 	}
 	expected := parts[1]
 	sum := sha256.Sum256(append(salt, []byte(password)...))
-	return expected == hex.EncodeToString(sum[:])
+	return subtle.ConstantTimeCompare([]byte(expected), []byte(hex.EncodeToString(sum[:]))) == 1, "legacy"
+}
+
+func pbkdf2SHA256(password, salt []byte, iterations, keyLen int) []byte {
+	if iterations <= 0 {
+		iterations = 1
+	}
+	hLen := 32
+	numBlocks := (keyLen + hLen - 1) / hLen
+	out := make([]byte, 0, numBlocks*hLen)
+
+	for block := 1; block <= numBlocks; block++ {
+		u := pbkdf2F(password, salt, iterations, block)
+		out = append(out, u...)
+	}
+	return out[:keyLen]
+}
+
+func pbkdf2F(password, salt []byte, iterations, blockIndex int) []byte {
+	mac := hmac.New(sha256.New, password)
+	mac.Write(salt)
+	mac.Write([]byte{
+		byte(blockIndex >> 24),
+		byte(blockIndex >> 16),
+		byte(blockIndex >> 8),
+		byte(blockIndex),
+	})
+	u := mac.Sum(nil)
+	t := make([]byte, len(u))
+	copy(t, u)
+
+	for i := 2; i <= iterations; i++ {
+		mac = hmac.New(sha256.New, password)
+		mac.Write(u)
+		u = mac.Sum(nil)
+		for j := range t {
+			t[j] ^= u[j]
+		}
+	}
+	return t
 }

@@ -89,6 +89,8 @@ export interface MemoEvent {
   content: string
   eventAt: string
   reminderEnabled: boolean
+  recurrenceType: 'once' | 'daily' | 'workday' | 'cron'
+  recurrenceExpr: string
   reminderPoints: ReminderPoint[]
   boundChannelIds: number[]
   boundGroupIds: number[]
@@ -131,9 +133,22 @@ export interface AuthUser {
   channels: NotificationChannel[]
 }
 
+export interface AdminAuditLog {
+  id: number
+  actorUserId: number
+  actorUsername: string
+  action: string
+  targetUserId: number
+  targetUsername: string
+  detail: string
+  createdAt: string
+}
+
 export interface AuthState {
   adminExists: boolean
   currentUser: AuthUser | null
+  loginMaxFailed: number
+  loginWindowSec: number
 }
 
 export interface AppState {

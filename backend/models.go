@@ -25,8 +25,10 @@ type AppState struct {
 }
 
 type AuthState struct {
-	AdminExists bool  `json:"adminExists"`
-	CurrentUser *User `json:"currentUser"`
+	AdminExists    bool  `json:"adminExists"`
+	CurrentUser    *User `json:"currentUser"`
+	LoginMaxFailed int   `json:"loginMaxFailed"`
+	LoginWindowSec int   `json:"loginWindowSec"`
 }
 
 type DatabaseConfig struct {
@@ -132,6 +134,8 @@ type MemoEvent struct {
 	Content            string                `json:"content"`
 	EventAt            time.Time             `json:"eventAt"`
 	ReminderEnabled    bool                  `json:"reminderEnabled"`
+	RecurrenceType     string                `json:"recurrenceType"`
+	RecurrenceExpr     string                `json:"recurrenceExpr"`
 	ReminderPoints     []ReminderPoint       `json:"reminderPoints"`
 	BoundChannelIDs    []int64               `json:"boundChannelIds"`
 	BoundGroupIDs      []int64               `json:"boundGroupIds"`
@@ -169,6 +173,19 @@ type ReminderTask struct {
 	ScheduledAt time.Time `json:"scheduledAt"`
 	TriggeredAt time.Time `json:"triggeredAt"`
 	LastError   string    `json:"lastError"`
+	RetryCount  int       `json:"retryCount"`
+	MaxRetries  int       `json:"maxRetries"`
+}
+
+type AdminAuditLog struct {
+	ID             int64     `json:"id"`
+	ActorUserID    int64     `json:"actorUserId"`
+	ActorUsername  string    `json:"actorUsername"`
+	Action         string    `json:"action"`
+	TargetUserID   int64     `json:"targetUserId"`
+	TargetUsername string    `json:"targetUsername"`
+	Detail         string    `json:"detail"`
+	CreatedAt      time.Time `json:"createdAt"`
 }
 
 type InitDatabaseRequest struct {
@@ -188,6 +205,8 @@ type CreateEventRequest struct {
 	Content         string          `json:"content"`
 	EventAt         string          `json:"eventAt"`
 	ReminderEnabled bool            `json:"reminderEnabled"`
+	RecurrenceType  string          `json:"recurrenceType"`
+	RecurrenceExpr  string          `json:"recurrenceExpr"`
 	ReminderPoints  []ReminderPoint `json:"reminderPoints"`
 	BoundChannelIDs []int64         `json:"boundChannelIds"`
 	BoundGroupIDs   []int64         `json:"boundGroupIds"`
@@ -234,6 +253,7 @@ type ReminderDispatchResult struct {
 	Sent      int `json:"sent"`
 	Failed    int `json:"failed"`
 	Skipped   int `json:"skipped"`
+	Retried   int `json:"retried"`
 }
 
 type SaveDingTalkConfigRequest struct {
@@ -285,6 +305,15 @@ type RegisterRequest struct {
 	Password string `json:"password"`
 	Email    string `json:"email"`
 	Name     string `json:"name"`
+}
+
+type AdminUpdateUserPasswordRequest struct {
+	Password string `json:"password"`
+}
+
+type AdminUpdateLoginPolicyRequest struct {
+	LoginMaxFailed int `json:"loginMaxFailed"`
+	LoginWindowSec int `json:"loginWindowSec"`
 }
 
 type AuthResponse struct {

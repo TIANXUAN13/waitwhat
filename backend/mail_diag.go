@@ -18,7 +18,7 @@ func (r *Repository) DiagnoseMail(ctx context.Context, userID int64, req Diagnos
 			return MailDiagnoseResult{}, err
 		}
 		defer db.Close()
-		cfg, err := loadUserMailConfig(ctx, db, r.cfg.Database.SelectedDriver, userID)
+		cfg, err := loadUserMailConfig(ctx, db, r.cfg.Database.SelectedDriver, r.cfg.Auth.TokenSecret, userID)
 		if err != nil {
 			return MailDiagnoseResult{}, err
 		}

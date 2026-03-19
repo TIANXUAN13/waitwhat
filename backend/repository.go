@@ -47,14 +47,16 @@ func (r *Repository) Bootstrap(ctx context.Context, currentUserID int64) (AppSta
 			groups, groupErr := loadNotificationGroups(ctx, db, r.cfg.Database.SelectedDriver, currentUserID)
 			if userErr == nil && eventErr == nil && logErr == nil && taskErr == nil && authErr == nil && groupErr == nil {
 				state.Auth.AdminExists = adminExists
+				state.Auth.LoginMaxFailed = r.cfg.Auth.LoginLimitMaxFail
+				state.Auth.LoginWindowSec = r.cfg.Auth.LoginLimitWindow
 				if currentUserID > 0 {
 					state.Users = filterUsersByID(users, currentUserID)
 					state.Events = filterEventsByUser(events, currentUserID)
 					state.Tasks = filterTasksByEvents(tasks, state.Events)
 					state.Logs = filterLogsByEvents(logs, state.Events)
 					state.NotifyGroups = groups
-					mailCfg, _ := loadUserMailConfig(ctx, db, r.cfg.Database.SelectedDriver, currentUserID)
-					dingCfg, _ := loadUserDingTalkConfig(ctx, db, r.cfg.Database.SelectedDriver, currentUserID)
+					mailCfg, _ := loadUserMailConfig(ctx, db, r.cfg.Database.SelectedDriver, r.cfg.Auth.TokenSecret, currentUserID)
+					dingCfg, _ := loadUserDingTalkConfig(ctx, db, r.cfg.Database.SelectedDriver, r.cfg.Auth.TokenSecret, currentUserID)
 					state.Mail = mailCfg.Safe()
 					state.DingTalk = dingCfg.Safe()
 				} else {
@@ -157,9 +159,17 @@ func (r *Repository) CreateEvent(ctx context.Context, req CreateEventRequest) (M
 		return MemoEvent{}, err
 	}
 
-	eventAt, err := time.Parse(time.RFC3339, req.EventAt)
+	recurrenceType := normalizeRecurrenceType(req.RecurrenceType)
+	if !isValidRecurrenceType(recurrenceType) {
+		return MemoEvent{}, errors.New("提醒周期类型不正确")
+	}
+	if recurrenceType == "cron" && strings.TrimSpace(req.RecurrenceExpr) == "" {
+		return MemoEvent{}, errors.New("Cron 周期模式下请填写表达式")
+	}
+
+	eventAt, err := resolveEventAt(req.EventAt, recurrenceType)
 	if err != nil {
-		return MemoEvent{}, errors.New("事件时间格式不正确")
+		return MemoEvent{}, err
 	}
 
 	now := time.Now()
@@ -170,16 +180,16 @@ func (r *Repository) CreateEvent(ctx context.Context, req CreateEventRequest) (M
 	defer tx.Rollback()
 
 	result, err := tx.ExecContext(ctx, `
-		INSERT INTO memo_events (user_id, title, content, event_at, reminder_enabled, bound_channel_ids, bound_group_ids, countdown_label, status, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		req.UserID, req.Title, req.Content, eventAt.Format(time.RFC3339), boolToInt(req.ReminderEnabled), encodeInt64List(req.BoundChannelIDs), encodeInt64List(req.BoundGroupIDs),
+		INSERT INTO memo_events (user_id, title, content, event_at, reminder_enabled, recurrence_type, recurrence_expr, bound_channel_ids, bound_group_ids, countdown_label, status, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		req.UserID, req.Title, req.Content, eventAt.Format(time.RFC3339), boolToInt(req.ReminderEnabled), recurrenceType, strings.TrimSpace(req.RecurrenceExpr), encodeInt64List(req.BoundChannelIDs), encodeInt64List(req.BoundGroupIDs),
 		"", "scheduled", now.Format(time.RFC3339), now.Format(time.RFC3339),
 	)
 	if err != nil && r.cfg.Database.SelectedDriver == DriverPG {
 		result, err = tx.ExecContext(ctx, `
-			INSERT INTO memo_events (user_id, title, content, event_at, reminder_enabled, bound_channel_ids, bound_group_ids, countdown_label, status, created_at, updated_at)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
-			req.UserID, req.Title, req.Content, eventAt.Format(time.RFC3339), boolToInt(req.ReminderEnabled), encodeInt64List(req.BoundChannelIDs), encodeInt64List(req.BoundGroupIDs),
+			INSERT INTO memo_events (user_id, title, content, event_at, reminder_enabled, recurrence_type, recurrence_expr, bound_channel_ids, bound_group_ids, countdown_label, status, created_at, updated_at)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
+			req.UserID, req.Title, req.Content, eventAt.Format(time.RFC3339), boolToInt(req.ReminderEnabled), recurrenceType, strings.TrimSpace(req.RecurrenceExpr), encodeInt64List(req.BoundChannelIDs), encodeInt64List(req.BoundGroupIDs),
 			"", "scheduled", now.Format(time.RFC3339), now.Format(time.RFC3339),
 		)
 	}
@@ -230,9 +240,17 @@ func (r *Repository) UpdateEvent(ctx context.Context, eventID, userID int64, req
 	}
 	defer db.Close()
 
-	eventAt, err := time.Parse(time.RFC3339, req.EventAt)
+	recurrenceType := normalizeRecurrenceType(req.RecurrenceType)
+	if !isValidRecurrenceType(recurrenceType) {
+		return MemoEvent{}, errors.New("提醒周期类型不正确")
+	}
+	if recurrenceType == "cron" && strings.TrimSpace(req.RecurrenceExpr) == "" {
+		return MemoEvent{}, errors.New("Cron 周期模式下请填写表达式")
+	}
+
+	eventAt, err := resolveEventAt(req.EventAt, recurrenceType)
 	if err != nil {
-		return MemoEvent{}, errors.New("事件时间格式不正确")
+		return MemoEvent{}, err
 	}
 
 	tx, err := db.BeginTx(ctx, nil)
@@ -242,9 +260,9 @@ func (r *Repository) UpdateEvent(ctx context.Context, eventID, userID int64, req
 	defer tx.Rollback()
 
 	res, err := execWithDriver(ctx, tx, r.cfg.Database.SelectedDriver,
-		`UPDATE memo_events SET title = ?, content = ?, event_at = ?, reminder_enabled = ?, bound_channel_ids = ?, bound_group_ids = ?, updated_at = ? WHERE id = ? AND user_id = ?`,
-		`UPDATE memo_events SET title = $1, content = $2, event_at = $3, reminder_enabled = $4, bound_channel_ids = $5, bound_group_ids = $6, updated_at = $7 WHERE id = $8 AND user_id = $9`,
-		req.Title, req.Content, eventAt.Format(time.RFC3339), boolToInt(req.ReminderEnabled), encodeInt64List(req.BoundChannelIDs), encodeInt64List(req.BoundGroupIDs), time.Now().Format(time.RFC3339), eventID, userID,
+		`UPDATE memo_events SET title = ?, content = ?, event_at = ?, reminder_enabled = ?, recurrence_type = ?, recurrence_expr = ?, bound_channel_ids = ?, bound_group_ids = ?, updated_at = ? WHERE id = ? AND user_id = ?`,
+		`UPDATE memo_events SET title = $1, content = $2, event_at = $3, reminder_enabled = $4, recurrence_type = $5, recurrence_expr = $6, bound_channel_ids = $7, bound_group_ids = $8, updated_at = $9 WHERE id = $10 AND user_id = $11`,
+		req.Title, req.Content, eventAt.Format(time.RFC3339), boolToInt(req.ReminderEnabled), recurrenceType, strings.TrimSpace(req.RecurrenceExpr), encodeInt64List(req.BoundChannelIDs), encodeInt64List(req.BoundGroupIDs), time.Now().Format(time.RFC3339), eventID, userID,
 	)
 	if err != nil {
 		return MemoEvent{}, err
@@ -441,7 +459,7 @@ func loadChannels(ctx context.Context, db *sql.DB, driver DatabaseDriver, userID
 }
 
 func loadEvents(ctx context.Context, db *sql.DB, driver DatabaseDriver) ([]MemoEvent, error) {
-	rows, err := db.QueryContext(ctx, "SELECT id, user_id, title, content, event_at, reminder_enabled, bound_channel_ids, bound_group_ids, countdown_label, status, created_at, updated_at FROM memo_events ORDER BY event_at")
+	rows, err := db.QueryContext(ctx, "SELECT id, user_id, title, content, event_at, reminder_enabled, recurrence_type, recurrence_expr, bound_channel_ids, bound_group_ids, countdown_label, status, created_at, updated_at FROM memo_events ORDER BY event_at")
 	if err != nil {
 		return nil, err
 	}
@@ -452,7 +470,7 @@ func loadEvents(ctx context.Context, db *sql.DB, driver DatabaseDriver) ([]MemoE
 		var event MemoEvent
 		var enabled int
 		var eventAt, createdAt, updatedAt, boundIDs, boundGroupIDs string
-		if err := rows.Scan(&event.ID, &event.UserID, &event.Title, &event.Content, &eventAt, &enabled, &boundIDs, &boundGroupIDs, &event.CountdownLabel, &event.Status, &createdAt, &updatedAt); err != nil {
+		if err := rows.Scan(&event.ID, &event.UserID, &event.Title, &event.Content, &eventAt, &enabled, &event.RecurrenceType, &event.RecurrenceExpr, &boundIDs, &boundGroupIDs, &event.CountdownLabel, &event.Status, &createdAt, &updatedAt); err != nil {
 			return nil, err
 		}
 		event.ReminderEnabled = enabled == 1
@@ -515,7 +533,7 @@ func loadLogs(ctx context.Context, db *sql.DB) ([]NotifyLog, error) {
 }
 
 func loadTasks(ctx context.Context, db *sql.DB) ([]ReminderTask, error) {
-	rows, err := db.QueryContext(ctx, "SELECT id, event_id, reminder_id, channel_id, channel_type, status, scheduled_at, triggered_at, last_error FROM reminder_tasks ORDER BY scheduled_at DESC, id DESC")
+	rows, err := db.QueryContext(ctx, "SELECT id, event_id, reminder_id, channel_id, channel_type, status, scheduled_at, triggered_at, last_error, retry_count, max_retries FROM reminder_tasks ORDER BY scheduled_at DESC, id DESC")
 	if err != nil {
 		return nil, err
 	}
@@ -525,7 +543,7 @@ func loadTasks(ctx context.Context, db *sql.DB) ([]ReminderTask, error) {
 	for rows.Next() {
 		var task ReminderTask
 		var scheduledAt, triggeredAt string
-		if err := rows.Scan(&task.ID, &task.EventID, &task.ReminderID, &task.ChannelID, &task.ChannelType, &task.Status, &scheduledAt, &triggeredAt, &task.LastError); err != nil {
+		if err := rows.Scan(&task.ID, &task.EventID, &task.ReminderID, &task.ChannelID, &task.ChannelType, &task.Status, &scheduledAt, &triggeredAt, &task.LastError, &task.RetryCount, &task.MaxRetries); err != nil {
 			return nil, err
 		}
 		task.ScheduledAt, _ = time.Parse(time.RFC3339, scheduledAt)
@@ -584,6 +602,240 @@ func (r *Repository) Register(ctx context.Context, req RegisterRequest) (User, e
 		return User{}, errors.New("请先创建管理员账号")
 	}
 	return r.insertUser(ctx, db, req.Username, req.Password, req.Email, firstNonEmpty(req.Name, req.Username), "user")
+}
+
+func (r *Repository) AdminListUsers(ctx context.Context) ([]User, error) {
+	db, err := r.openDB()
+	if err != nil {
+		return nil, err
+	}
+	defer db.Close()
+	return loadUsers(ctx, db, r.cfg.Database.SelectedDriver)
+}
+
+func (r *Repository) AdminUpdateUserPassword(ctx context.Context, userID int64, password string) error {
+	if strings.TrimSpace(password) == "" {
+		return errors.New("密码不能为空")
+	}
+	hash, err := hashPassword(password)
+	if err != nil {
+		return err
+	}
+	db, err := r.openDB()
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	res, err := execWithDriver(ctx, db, r.cfg.Database.SelectedDriver,
+		`UPDATE users SET password_hash = ? WHERE id = ?`,
+		`UPDATE users SET password_hash = $1 WHERE id = $2`,
+		hash, userID,
+	)
+	if err != nil {
+		return err
+	}
+	affected, _ := res.RowsAffected()
+	if affected == 0 {
+		return errors.New("用户不存在")
+	}
+	return nil
+}
+
+func (r *Repository) AdminDeleteUser(ctx context.Context, userID int64) error {
+	db, err := r.openDB()
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	var role string
+	var username string
+	query := "SELECT role, username FROM users WHERE id = ?"
+	if r.cfg.Database.SelectedDriver == DriverPG {
+		query = "SELECT role, username FROM users WHERE id = $1"
+	}
+	if err := db.QueryRowContext(ctx, query, userID).Scan(&role, &username); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return errors.New("用户不存在")
+		}
+		return err
+	}
+	if role == "admin" {
+		return errors.New("管理员账号不允许删除")
+	}
+
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if _, err := execWithDriver(ctx, tx, r.cfg.Database.SelectedDriver,
+		`DELETE FROM notification_group_members WHERE group_id IN (SELECT id FROM notification_groups WHERE user_id = ?)`,
+		`DELETE FROM notification_group_members WHERE group_id IN (SELECT id FROM notification_groups WHERE user_id = $1)`,
+		userID,
+	); err != nil {
+		return err
+	}
+	if _, err := execWithDriver(ctx, tx, r.cfg.Database.SelectedDriver,
+		`DELETE FROM notification_groups WHERE user_id = ?`,
+		`DELETE FROM notification_groups WHERE user_id = $1`,
+		userID,
+	); err != nil {
+		return err
+	}
+	if _, err := execWithDriver(ctx, tx, r.cfg.Database.SelectedDriver,
+		`DELETE FROM user_mail_settings WHERE user_id = ?`,
+		`DELETE FROM user_mail_settings WHERE user_id = $1`,
+		userID,
+	); err != nil {
+		return err
+	}
+	if _, err := execWithDriver(ctx, tx, r.cfg.Database.SelectedDriver,
+		`DELETE FROM user_dingtalk_settings WHERE user_id = ?`,
+		`DELETE FROM user_dingtalk_settings WHERE user_id = $1`,
+		userID,
+	); err != nil {
+		return err
+	}
+	if _, err := execWithDriver(ctx, tx, r.cfg.Database.SelectedDriver,
+		`DELETE FROM notification_channels WHERE user_id = ?`,
+		`DELETE FROM notification_channels WHERE user_id = $1`,
+		userID,
+	); err != nil {
+		return err
+	}
+	if _, err := execWithDriver(ctx, tx, r.cfg.Database.SelectedDriver,
+		`DELETE FROM notification_logs WHERE event_id IN (SELECT id FROM memo_events WHERE user_id = ?)`,
+		`DELETE FROM notification_logs WHERE event_id IN (SELECT id FROM memo_events WHERE user_id = $1)`,
+		userID,
+	); err != nil {
+		return err
+	}
+	if _, err := execWithDriver(ctx, tx, r.cfg.Database.SelectedDriver,
+		`DELETE FROM reminder_tasks WHERE event_id IN (SELECT id FROM memo_events WHERE user_id = ?)`,
+		`DELETE FROM reminder_tasks WHERE event_id IN (SELECT id FROM memo_events WHERE user_id = $1)`,
+		userID,
+	); err != nil {
+		return err
+	}
+	if _, err := execWithDriver(ctx, tx, r.cfg.Database.SelectedDriver,
+		`DELETE FROM reminder_points WHERE event_id IN (SELECT id FROM memo_events WHERE user_id = ?)`,
+		`DELETE FROM reminder_points WHERE event_id IN (SELECT id FROM memo_events WHERE user_id = $1)`,
+		userID,
+	); err != nil {
+		return err
+	}
+	if _, err := execWithDriver(ctx, tx, r.cfg.Database.SelectedDriver,
+		`DELETE FROM memo_events WHERE user_id = ?`,
+		`DELETE FROM memo_events WHERE user_id = $1`,
+		userID,
+	); err != nil {
+		return err
+	}
+	res, err := execWithDriver(ctx, tx, r.cfg.Database.SelectedDriver,
+		`DELETE FROM users WHERE id = ?`,
+		`DELETE FROM users WHERE id = $1`,
+		userID,
+	)
+	if err != nil {
+		return err
+	}
+	affected, _ := res.RowsAffected()
+	if affected == 0 {
+		return errors.New("用户不存在")
+	}
+	return tx.Commit()
+}
+
+func (r *Repository) adminGetUserByID(ctx context.Context, userID int64) (User, error) {
+	db, err := r.openDB()
+	if err != nil {
+		return User{}, err
+	}
+	defer db.Close()
+	query := "SELECT id, username, name, email, role FROM users WHERE id = ?"
+	if r.cfg.Database.SelectedDriver == DriverPG {
+		query = "SELECT id, username, name, email, role FROM users WHERE id = $1"
+	}
+	var user User
+	if err := db.QueryRowContext(ctx, query, userID).Scan(&user.ID, &user.Username, &user.Name, &user.Email, &user.Role); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return User{}, errors.New("用户不存在")
+		}
+		return User{}, err
+	}
+	return user, nil
+}
+
+func (r *Repository) AppendAdminAuditLog(ctx context.Context, actor User, item AdminAuditLog) error {
+	db, err := r.openDB()
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	_, err = execWithDriver(ctx, db, r.cfg.Database.SelectedDriver,
+		`INSERT INTO admin_audit_logs (actor_user_id, actor_username, action, target_user_id, target_username, detail, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO admin_audit_logs (actor_user_id, actor_username, action, target_user_id, target_username, detail, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+		actor.ID, actor.Username, item.Action, item.TargetUserID, item.TargetUsername, item.Detail, time.Now().Format(time.RFC3339),
+	)
+	return err
+}
+
+func (r *Repository) AdminListAuditLogs(ctx context.Context, limit, offset int) ([]AdminAuditLog, int, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	if limit > 200 {
+		limit = 200
+	}
+	if offset < 0 {
+		offset = 0
+	}
+
+	db, err := r.openDB()
+	if err != nil {
+		return nil, 0, err
+	}
+	defer db.Close()
+
+	totalQuery := "SELECT COUNT(*) FROM admin_audit_logs"
+	var total int
+	if err := db.QueryRowContext(ctx, totalQuery).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+
+	query := `SELECT id, actor_user_id, actor_username, action, target_user_id, target_username, detail, created_at
+		FROM admin_audit_logs
+		ORDER BY id DESC
+		LIMIT ? OFFSET ?`
+	args := []any{limit, offset}
+	if r.cfg.Database.SelectedDriver == DriverPG {
+		query = `SELECT id, actor_user_id, actor_username, action, target_user_id, target_username, detail, created_at
+			FROM admin_audit_logs
+			ORDER BY id DESC
+			LIMIT $1 OFFSET $2`
+	}
+	rows, err := db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+
+	items := make([]AdminAuditLog, 0, limit)
+	for rows.Next() {
+		var row AdminAuditLog
+		var createdAt string
+		if err := rows.Scan(&row.ID, &row.ActorUserID, &row.ActorUsername, &row.Action, &row.TargetUserID, &row.TargetUsername, &row.Detail, &createdAt); err != nil {
+			return nil, 0, err
+		}
+		row.CreatedAt, _ = time.Parse(time.RFC3339, createdAt)
+		items = append(items, row)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, err
+	}
+	return items, total, nil
 }
 
 func (r *Repository) insertUser(ctx context.Context, db *sql.DB, username, password, email, name, role string) (User, error) {
@@ -769,6 +1021,15 @@ func (r *Repository) Authenticate(ctx context.Context, username, password string
 	if !verifyPassword(hash, password) {
 		return User{}, errors.New("用户名或密码错误")
 	}
+	if needsPasswordRehash(hash) {
+		if nextHash, hashErr := hashPassword(password); hashErr == nil {
+			_, _ = execWithDriver(ctx, db, r.cfg.Database.SelectedDriver,
+				`UPDATE users SET password_hash = ? WHERE id = ?`,
+				`UPDATE users SET password_hash = $1 WHERE id = $2`,
+				nextHash, user.ID,
+			)
+		}
+	}
 	user.Channels, err = loadChannels(ctx, db, r.cfg.Database.SelectedDriver, user.ID)
 	if err != nil {
 		return User{}, err
@@ -923,6 +1184,38 @@ func decodeInt64List(raw string) []int64 {
 	return ids
 }
 
+func normalizeRecurrenceType(raw string) string {
+	value := strings.ToLower(strings.TrimSpace(raw))
+	if value == "" {
+		return "once"
+	}
+	return value
+}
+
+func isValidRecurrenceType(value string) bool {
+	switch value {
+	case "once", "daily", "workday", "cron":
+		return true
+	default:
+		return false
+	}
+}
+
+func resolveEventAt(raw, recurrenceType string) (time.Time, error) {
+	text := strings.TrimSpace(raw)
+	if text == "" {
+		if recurrenceType == "cron" {
+			return time.Now(), nil
+		}
+		return time.Time{}, errors.New("事件时间不能为空")
+	}
+	eventAt, err := time.Parse(time.RFC3339, text)
+	if err != nil {
+		return time.Time{}, errors.New("事件时间格式不正确")
+	}
+	return eventAt, nil
+}
+
 func normalizeReminderPoints(points []ReminderPoint) []ReminderPoint {
 	if len(points) == 0 {
 		return []ReminderPoint{{Label: "到点提醒", OffsetMin: 0}}
@@ -989,6 +1282,8 @@ var sqliteSchema = []string{
 		content TEXT NOT NULL,
 		event_at TEXT NOT NULL,
 		reminder_enabled INTEGER NOT NULL DEFAULT 1,
+		recurrence_type TEXT NOT NULL DEFAULT 'once',
+		recurrence_expr TEXT NOT NULL DEFAULT '',
 		bound_channel_ids TEXT NOT NULL DEFAULT '[]',
 		bound_group_ids TEXT NOT NULL DEFAULT '[]',
 		countdown_label TEXT NOT NULL DEFAULT '',
@@ -997,6 +1292,8 @@ var sqliteSchema = []string{
 		updated_at TEXT NOT NULL
 	)`,
 	`ALTER TABLE memo_events ADD COLUMN bound_group_ids TEXT NOT NULL DEFAULT '[]'`,
+	`ALTER TABLE memo_events ADD COLUMN recurrence_type TEXT NOT NULL DEFAULT 'once'`,
+	`ALTER TABLE memo_events ADD COLUMN recurrence_expr TEXT NOT NULL DEFAULT ''`,
 	`CREATE TABLE IF NOT EXISTS reminder_points (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		event_id INTEGER NOT NULL,
@@ -1024,8 +1321,12 @@ var sqliteSchema = []string{
 		scheduled_at TEXT NOT NULL,
 		triggered_at TEXT NOT NULL DEFAULT '',
 		last_error TEXT NOT NULL DEFAULT '',
+		retry_count INTEGER NOT NULL DEFAULT 0,
+		max_retries INTEGER NOT NULL DEFAULT 5,
 		UNIQUE(event_id, reminder_id, channel_id)
 	)`,
+	`ALTER TABLE reminder_tasks ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE reminder_tasks ADD COLUMN max_retries INTEGER NOT NULL DEFAULT 5`,
 	`CREATE TABLE IF NOT EXISTS user_mail_settings (
 		user_id INTEGER PRIMARY KEY,
 		enabled INTEGER NOT NULL DEFAULT 0,
@@ -1067,6 +1368,16 @@ var sqliteSchema = []string{
 		enabled INTEGER NOT NULL DEFAULT 1
 	)`,
 	`ALTER TABLE notification_group_members ADD COLUMN keyword TEXT NOT NULL DEFAULT ''`,
+	`CREATE TABLE IF NOT EXISTS admin_audit_logs (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		actor_user_id INTEGER NOT NULL DEFAULT 0,
+		actor_username TEXT NOT NULL DEFAULT '',
+		action TEXT NOT NULL,
+		target_user_id INTEGER NOT NULL DEFAULT 0,
+		target_username TEXT NOT NULL DEFAULT '',
+		detail TEXT NOT NULL DEFAULT '',
+		created_at TEXT NOT NULL
+	)`,
 }
 
 var postgresSchema = []string{
@@ -1099,6 +1410,8 @@ var postgresSchema = []string{
 		content TEXT NOT NULL,
 		event_at TEXT NOT NULL,
 		reminder_enabled INTEGER NOT NULL DEFAULT 1,
+		recurrence_type TEXT NOT NULL DEFAULT 'once',
+		recurrence_expr TEXT NOT NULL DEFAULT '',
 		bound_channel_ids TEXT NOT NULL DEFAULT '[]',
 		bound_group_ids TEXT NOT NULL DEFAULT '[]',
 		countdown_label TEXT NOT NULL DEFAULT '',
@@ -1107,6 +1420,8 @@ var postgresSchema = []string{
 		updated_at TEXT NOT NULL
 	)`,
 	`ALTER TABLE memo_events ADD COLUMN IF NOT EXISTS bound_group_ids TEXT NOT NULL DEFAULT '[]'`,
+	`ALTER TABLE memo_events ADD COLUMN IF NOT EXISTS recurrence_type TEXT NOT NULL DEFAULT 'once'`,
+	`ALTER TABLE memo_events ADD COLUMN IF NOT EXISTS recurrence_expr TEXT NOT NULL DEFAULT ''`,
 	`CREATE TABLE IF NOT EXISTS reminder_points (
 		id BIGSERIAL PRIMARY KEY,
 		event_id BIGINT NOT NULL,
@@ -1134,8 +1449,12 @@ var postgresSchema = []string{
 		scheduled_at TEXT NOT NULL,
 		triggered_at TEXT NOT NULL DEFAULT '',
 		last_error TEXT NOT NULL DEFAULT '',
+		retry_count INTEGER NOT NULL DEFAULT 0,
+		max_retries INTEGER NOT NULL DEFAULT 5,
 		UNIQUE(event_id, reminder_id, channel_id)
 	)`,
+	`ALTER TABLE reminder_tasks ADD COLUMN IF NOT EXISTS retry_count INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE reminder_tasks ADD COLUMN IF NOT EXISTS max_retries INTEGER NOT NULL DEFAULT 5`,
 	`CREATE TABLE IF NOT EXISTS user_mail_settings (
 		user_id BIGINT PRIMARY KEY,
 		enabled INTEGER NOT NULL DEFAULT 0,
@@ -1177,4 +1496,14 @@ var postgresSchema = []string{
 		enabled INTEGER NOT NULL DEFAULT 1
 	)`,
 	`ALTER TABLE notification_group_members ADD COLUMN IF NOT EXISTS keyword TEXT NOT NULL DEFAULT ''`,
+	`CREATE TABLE IF NOT EXISTS admin_audit_logs (
+		id BIGSERIAL PRIMARY KEY,
+		actor_user_id BIGINT NOT NULL DEFAULT 0,
+		actor_username TEXT NOT NULL DEFAULT '',
+		action TEXT NOT NULL,
+		target_user_id BIGINT NOT NULL DEFAULT 0,
+		target_username TEXT NOT NULL DEFAULT '',
+		detail TEXT NOT NULL DEFAULT '',
+		created_at TEXT NOT NULL
+	)`,
 }

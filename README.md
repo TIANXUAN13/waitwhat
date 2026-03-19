@@ -69,6 +69,20 @@ npm run dev
 
 如果直接在 `./dev.sh` 运行界面中按 `Ctrl+C`，也会自动清理前后端进程。
 
+## Docker 镜像发布（GitHub Actions）
+
+项目已支持通过 GitHub Actions 自动构建并推送后端镜像到 Docker Hub。
+
+需要在仓库 Secrets 配置：
+
+- `DOCKERHUB_USERNAME`
+- `DOCKERHUB_TOKEN`
+
+触发方式：
+
+- 推送 tag（例如 `v1.0.0`）自动发布
+- 手动触发工作流也可发布
+
 ## 说明
 
 前端当前包含一版高保真原型界面和接口接入结构。  

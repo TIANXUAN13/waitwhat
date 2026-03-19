@@ -19,7 +19,9 @@ type AppConfig struct {
 }
 
 type AuthConfig struct {
-	TokenSecret string `json:"tokenSecret"`
+	TokenSecret       string `json:"tokenSecret"`
+	LoginLimitMaxFail int    `json:"loginLimitMaxFail"`
+	LoginLimitWindow  int    `json:"loginLimitWindowSeconds"`
 }
 
 func defaultConfig() AppConfig {
@@ -34,7 +36,9 @@ func defaultConfig() AppConfig {
 			Port: 587,
 		},
 		Auth: AuthConfig{
-			TokenSecret: randomSecret(),
+			TokenSecret:       randomSecret(),
+			LoginLimitMaxFail: 5,
+			LoginLimitWindow:  600,
 		},
 	}
 }
@@ -84,6 +88,12 @@ func loadConfig() (AppConfig, error) {
 	if cfg.Auth.TokenSecret == "" {
 		cfg.Auth.TokenSecret = randomSecret()
 	}
+	if cfg.Auth.LoginLimitMaxFail <= 0 {
+		cfg.Auth.LoginLimitMaxFail = 5
+	}
+	if cfg.Auth.LoginLimitWindow <= 0 {
+		cfg.Auth.LoginLimitWindow = 600
+	}
 	return cfg, nil
 }
 
@@ -97,7 +107,7 @@ func saveConfig(cfg AppConfig) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0o644)
+	return os.WriteFile(path, data, 0o600)
 }
 
 func randomSecret() string {

@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"math"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -16,7 +18,7 @@ func (r *Repository) SaveMailConfig(ctx context.Context, userID int64, req SaveM
 	}
 	defer db.Close()
 
-	existing, err := loadUserMailConfig(ctx, db, r.cfg.Database.SelectedDriver, userID)
+	existing, err := loadUserMailConfig(ctx, db, r.cfg.Database.SelectedDriver, r.cfg.Auth.TokenSecret, userID)
 	if err != nil {
 		return MailConfig{}, err
 	}
@@ -44,7 +46,7 @@ func (r *Repository) SaveMailConfig(ctx context.Context, userID int64, req SaveM
 	if cfg.FromAddress == "" && cfg.Enabled {
 		return MailConfig{}, errors.New("发件人邮箱不能为空")
 	}
-	if err := saveUserMailConfig(ctx, db, r.cfg.Database.SelectedDriver, userID, cfg); err != nil {
+	if err := saveUserMailConfig(ctx, db, r.cfg.Database.SelectedDriver, r.cfg.Auth.TokenSecret, userID, cfg); err != nil {
 		return MailConfig{}, err
 	}
 	if err := syncChannelConfig(ctx, db, r.cfg.Database.SelectedDriver, userID, "email", firstNonEmpty(cfg.FromAddress, req.Username), cfg.Enabled); err != nil {
@@ -62,7 +64,7 @@ func (r *Repository) SendTestMail(ctx context.Context, userID int64, to string) 
 		return err
 	}
 	defer db.Close()
-	cfg, err := loadUserMailConfig(ctx, db, r.cfg.Database.SelectedDriver, userID)
+	cfg, err := loadUserMailConfig(ctx, db, r.cfg.Database.SelectedDriver, r.cfg.Auth.TokenSecret, userID)
 	if err != nil {
 		return err
 	}
@@ -97,7 +99,7 @@ func (r *Repository) SaveDingTalkConfig(ctx context.Context, userID int64, req S
 		return DingTalkConfig{}, err
 	}
 	defer db.Close()
-	if err := saveUserDingTalkConfig(ctx, db, r.cfg.Database.SelectedDriver, userID, cfg); err != nil {
+	if err := saveUserDingTalkConfig(ctx, db, r.cfg.Database.SelectedDriver, r.cfg.Auth.TokenSecret, userID, cfg); err != nil {
 		return DingTalkConfig{}, err
 	}
 	if err := syncChannelConfig(ctx, db, r.cfg.Database.SelectedDriver, userID, "dingtalk", cfg.Webhook, cfg.Enabled); err != nil {
@@ -168,13 +170,16 @@ func (r *Repository) enqueueDueTasks(ctx context.Context, db *sql.DB) error {
 		if !event.ReminderEnabled {
 			continue
 		}
+		if isExpiredOneTimeEvent(event, now) {
+			continue
+		}
 		user, ok := userMap[event.UserID]
 		if !ok {
 			continue
 		}
 		for _, point := range event.ReminderPoints {
-			notifyAt := event.EventAt.Add(-time.Duration(point.OffsetMin) * time.Minute)
-			if notifyAt.After(now) {
+			notifyAt, ok := computeNotifyAt(event, point, now)
+			if !ok {
 				continue
 			}
 			for _, group := range groupMap[user.ID] {
@@ -230,7 +235,15 @@ func (r *Repository) runPendingTasks(ctx context.Context, db *sql.DB) (ReminderD
 	}
 
 	result := ReminderDispatchResult{}
+	now := time.Now()
 	for _, task := range tasks {
+		claimed, err := claimTaskForProcessing(ctx, db, r.cfg.Database.SelectedDriver, task.ID)
+		if err != nil {
+			return result, err
+		}
+		if !claimed {
+			continue
+		}
 		result.Triggered++
 		event, ok := eventMap[task.EventID]
 		if !ok {
@@ -242,6 +255,11 @@ func (r *Repository) runPendingTasks(ctx context.Context, db *sql.DB) (ReminderD
 		if !ok {
 			result.Skipped++
 			_ = markTaskDone(ctx, db, r.cfg.Database.SelectedDriver, task.ID, "skipped", "未找到事件所属用户")
+			continue
+		}
+		if isExpiredOneTimeEvent(event, now) {
+			result.Skipped++
+			_ = markTaskDone(ctx, db, r.cfg.Database.SelectedDriver, task.ID, "skipped", "一次性事件已过期，跳过推送")
 			continue
 		}
 
@@ -279,11 +297,21 @@ func (r *Repository) runPendingTasks(ctx context.Context, db *sql.DB) (ReminderD
 		}
 
 		if sendErr != nil {
-			logEntry.Status = "failed"
-			logEntry.Message = sendErr.Error()
-			result.Failed++
-			if err := markTaskDone(ctx, db, r.cfg.Database.SelectedDriver, task.ID, "failed", sendErr.Error()); err != nil {
-				return result, err
+			if task.RetryCount < task.MaxRetries {
+				nextAt := time.Now().Add(nextRetryDelay(task.RetryCount + 1))
+				logEntry.Status = "retrying"
+				logEntry.Message = fmt.Sprintf("发送失败，将重试(%d/%d)：%v", task.RetryCount+1, task.MaxRetries, sendErr)
+				result.Retried++
+				if err := markTaskRetry(ctx, db, r.cfg.Database.SelectedDriver, task.ID, task.RetryCount+1, nextAt, sendErr.Error()); err != nil {
+					return result, err
+				}
+			} else {
+				logEntry.Status = "failed"
+				logEntry.Message = sendErr.Error()
+				result.Failed++
+				if err := markTaskDone(ctx, db, r.cfg.Database.SelectedDriver, task.ID, "failed", sendErr.Error()); err != nil {
+					return result, err
+				}
 			}
 		} else if logEntry.Status == "" {
 			logEntry.Status = "success"
@@ -311,7 +339,7 @@ func (r *Repository) runPendingTasks(ctx context.Context, db *sql.DB) (ReminderD
 }
 
 func (r *Repository) sendEventEmail(ctx context.Context, db *sql.DB, to string, user User, event MemoEvent, point ReminderPoint) error {
-	cfg, err := loadUserMailConfig(ctx, db, r.cfg.Database.SelectedDriver, user.ID)
+	cfg, err := loadUserMailConfig(ctx, db, r.cfg.Database.SelectedDriver, r.cfg.Auth.TokenSecret, user.ID)
 	if err != nil {
 		return err
 	}
@@ -331,7 +359,7 @@ func (r *Repository) sendEventEmail(ctx context.Context, db *sql.DB, to string, 
 }
 
 func (r *Repository) sendEventDingTalk(ctx context.Context, db *sql.DB, user User, event MemoEvent, point ReminderPoint) error {
-	cfg, err := loadUserDingTalkConfig(ctx, db, r.cfg.Database.SelectedDriver, user.ID)
+	cfg, err := loadUserDingTalkConfig(ctx, db, r.cfg.Database.SelectedDriver, r.cfg.Auth.TokenSecret, user.ID)
 	if err != nil {
 		return err
 	}
@@ -364,20 +392,24 @@ func (r *Repository) sendEventDingTalkWebhook(member NotificationGroupMember, ev
 	return sender.Send(title, body)
 }
 
-func saveUserMailConfig(ctx context.Context, db *sql.DB, driver DatabaseDriver, userID int64, cfg MailConfig) error {
-	_, err := execWithDriver(ctx, db, driver,
+func saveUserMailConfig(ctx context.Context, db *sql.DB, driver DatabaseDriver, masterSecret string, userID int64, cfg MailConfig) error {
+	encryptedPassword, err := encryptSecret(cfg.Password, masterSecret)
+	if err != nil {
+		return err
+	}
+	_, err = execWithDriver(ctx, db, driver,
 		`INSERT INTO user_mail_settings (user_id, enabled, host, port, username, password, from_name, from_address, use_tls, use_ssl, initialized)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(user_id) DO UPDATE SET enabled=excluded.enabled, host=excluded.host, port=excluded.port, username=excluded.username, password=excluded.password, from_name=excluded.from_name, from_address=excluded.from_address, use_tls=excluded.use_tls, use_ssl=excluded.use_ssl, initialized=excluded.initialized`,
 		`INSERT INTO user_mail_settings (user_id, enabled, host, port, username, password, from_name, from_address, use_tls, use_ssl, initialized)
 		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
 		 ON CONFLICT (user_id) DO UPDATE SET enabled=EXCLUDED.enabled, host=EXCLUDED.host, port=EXCLUDED.port, username=EXCLUDED.username, password=EXCLUDED.password, from_name=EXCLUDED.from_name, from_address=EXCLUDED.from_address, use_tls=EXCLUDED.use_tls, use_ssl=EXCLUDED.use_ssl, initialized=EXCLUDED.initialized`,
-		userID, boolToInt(cfg.Enabled), cfg.Host, cfg.Port, cfg.Username, cfg.Password, cfg.FromName, cfg.FromAddress, boolToInt(cfg.UseTLS), boolToInt(cfg.UseSSL), cfg.Initialized.Format(time.RFC3339),
+		userID, boolToInt(cfg.Enabled), cfg.Host, cfg.Port, cfg.Username, encryptedPassword, cfg.FromName, cfg.FromAddress, boolToInt(cfg.UseTLS), boolToInt(cfg.UseSSL), cfg.Initialized.Format(time.RFC3339),
 	)
 	return err
 }
 
-func loadUserMailConfig(ctx context.Context, db *sql.DB, driver DatabaseDriver, userID int64) (MailConfig, error) {
+func loadUserMailConfig(ctx context.Context, db *sql.DB, driver DatabaseDriver, masterSecret string, userID int64) (MailConfig, error) {
 	query := `SELECT enabled, host, port, username, password, from_name, from_address, use_tls, use_ssl, initialized FROM user_mail_settings WHERE user_id = ?`
 	if driver == DriverPG {
 		query = `SELECT enabled, host, port, username, password, from_name, from_address, use_tls, use_ssl, initialized FROM user_mail_settings WHERE user_id = $1`
@@ -391,6 +423,11 @@ func loadUserMailConfig(ctx context.Context, db *sql.DB, driver DatabaseDriver, 
 		}
 		return MailConfig{}, err
 	}
+	decrypted, err := decryptSecret(cfg.Password, masterSecret)
+	if err != nil {
+		return MailConfig{}, err
+	}
+	cfg.Password = decrypted
 	cfg.Enabled = enabled == 1
 	cfg.UseTLS = useTLS == 1
 	cfg.UseSSL = useSSL == 1
@@ -398,15 +435,19 @@ func loadUserMailConfig(ctx context.Context, db *sql.DB, driver DatabaseDriver, 
 	return cfg, nil
 }
 
-func saveUserDingTalkConfig(ctx context.Context, db *sql.DB, driver DatabaseDriver, userID int64, cfg DingTalkConfig) error {
-	_, err := execWithDriver(ctx, db, driver,
+func saveUserDingTalkConfig(ctx context.Context, db *sql.DB, driver DatabaseDriver, masterSecret string, userID int64, cfg DingTalkConfig) error {
+	encryptedSecret, err := encryptSecret(cfg.Secret, masterSecret)
+	if err != nil {
+		return err
+	}
+	_, err = execWithDriver(ctx, db, driver,
 		`INSERT INTO user_dingtalk_settings (user_id, enabled, webhook, secret, use_sign, keyword, initialized)
 		 VALUES (?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(user_id) DO UPDATE SET enabled=excluded.enabled, webhook=excluded.webhook, secret=excluded.secret, use_sign=excluded.use_sign, keyword=excluded.keyword, initialized=excluded.initialized`,
 		`INSERT INTO user_dingtalk_settings (user_id, enabled, webhook, secret, use_sign, keyword, initialized)
 		 VALUES ($1,$2,$3,$4,$5,$6,$7)
 		 ON CONFLICT (user_id) DO UPDATE SET enabled=EXCLUDED.enabled, webhook=EXCLUDED.webhook, secret=EXCLUDED.secret, use_sign=EXCLUDED.use_sign, keyword=EXCLUDED.keyword, initialized=EXCLUDED.initialized`,
-		userID, boolToInt(cfg.Enabled), cfg.Webhook, cfg.Secret, boolToInt(cfg.UseSign), cfg.Keyword, cfg.Initialized.Format(time.RFC3339),
+		userID, boolToInt(cfg.Enabled), cfg.Webhook, encryptedSecret, boolToInt(cfg.UseSign), cfg.Keyword, cfg.Initialized.Format(time.RFC3339),
 	)
 	return err
 }
@@ -420,7 +461,7 @@ func syncChannelConfig(ctx context.Context, db *sql.DB, driver DatabaseDriver, u
 	return err
 }
 
-func loadUserDingTalkConfig(ctx context.Context, db *sql.DB, driver DatabaseDriver, userID int64) (DingTalkConfig, error) {
+func loadUserDingTalkConfig(ctx context.Context, db *sql.DB, driver DatabaseDriver, masterSecret string, userID int64) (DingTalkConfig, error) {
 	query := `SELECT enabled, webhook, secret, use_sign, keyword, initialized FROM user_dingtalk_settings WHERE user_id = ?`
 	if driver == DriverPG {
 		query = `SELECT enabled, webhook, secret, use_sign, keyword, initialized FROM user_dingtalk_settings WHERE user_id = $1`
@@ -434,6 +475,11 @@ func loadUserDingTalkConfig(ctx context.Context, db *sql.DB, driver DatabaseDriv
 		}
 		return DingTalkConfig{}, err
 	}
+	decrypted, err := decryptSecret(cfg.Secret, masterSecret)
+	if err != nil {
+		return DingTalkConfig{}, err
+	}
+	cfg.Secret = decrypted
 	cfg.Enabled = enabled == 1
 	cfg.UseSign = useSign == 1
 	cfg.Initialized, _ = time.Parse(time.RFC3339, initialized)
@@ -441,7 +487,8 @@ func loadUserDingTalkConfig(ctx context.Context, db *sql.DB, driver DatabaseDriv
 }
 
 func loadPendingTasks(ctx context.Context, db *sql.DB) ([]ReminderTask, error) {
-	rows, err := db.QueryContext(ctx, "SELECT id, event_id, reminder_id, channel_id, channel_type, status, scheduled_at, triggered_at, last_error FROM reminder_tasks WHERE status = 'pending' ORDER BY scheduled_at ASC, id ASC")
+	now := time.Now().Format(time.RFC3339)
+	rows, err := db.QueryContext(ctx, "SELECT id, event_id, reminder_id, channel_id, channel_type, status, scheduled_at, triggered_at, last_error, retry_count, max_retries FROM reminder_tasks WHERE status = 'pending' AND scheduled_at <= ? ORDER BY scheduled_at ASC, id ASC", now)
 	if err != nil {
 		return nil, err
 	}
@@ -451,7 +498,7 @@ func loadPendingTasks(ctx context.Context, db *sql.DB) ([]ReminderTask, error) {
 	for rows.Next() {
 		var task ReminderTask
 		var scheduledAt, triggeredAt string
-		if err := rows.Scan(&task.ID, &task.EventID, &task.ReminderID, &task.ChannelID, &task.ChannelType, &task.Status, &scheduledAt, &triggeredAt, &task.LastError); err != nil {
+		if err := rows.Scan(&task.ID, &task.EventID, &task.ReminderID, &task.ChannelID, &task.ChannelType, &task.Status, &scheduledAt, &triggeredAt, &task.LastError, &task.RetryCount, &task.MaxRetries); err != nil {
 			return nil, err
 		}
 		task.ScheduledAt, _ = time.Parse(time.RFC3339, scheduledAt)
@@ -464,15 +511,36 @@ func loadPendingTasks(ctx context.Context, db *sql.DB) ([]ReminderTask, error) {
 }
 
 func ensureReminderTask(ctx context.Context, db *sql.DB, driver DatabaseDriver, eventID, reminderID, channelID int64, channelType string, scheduledAt time.Time) error {
-	_, err := execWithDriver(ctx, db, driver,
-		`INSERT OR IGNORE INTO reminder_tasks (event_id, reminder_id, channel_id, channel_type, status, scheduled_at, triggered_at, last_error)
-		 VALUES (?, ?, ?, ?, 'pending', ?, '', '')`,
-		`INSERT INTO reminder_tasks (event_id, reminder_id, channel_id, channel_type, status, scheduled_at, triggered_at, last_error)
-		 VALUES ($1, $2, $3, $4, 'pending', $5, '', '')
-		 ON CONFLICT (event_id, reminder_id, channel_id) DO NOTHING`,
-		eventID, reminderID, channelID, channelType, scheduledAt.Format(time.RFC3339),
+	query := `SELECT id, scheduled_at FROM reminder_tasks WHERE event_id = ? AND reminder_id = ? AND channel_id = ?`
+	if driver == DriverPG {
+		query = `SELECT id, scheduled_at FROM reminder_tasks WHERE event_id = $1 AND reminder_id = $2 AND channel_id = $3`
+	}
+	var taskID int64
+	var existingScheduled string
+	err := db.QueryRowContext(ctx, query, eventID, reminderID, channelID).Scan(&taskID, &existingScheduled)
+	if err != nil {
+		if !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+		_, insertErr := execWithDriver(ctx, db, driver,
+			`INSERT INTO reminder_tasks (event_id, reminder_id, channel_id, channel_type, status, scheduled_at, triggered_at, last_error, retry_count, max_retries)
+			 VALUES (?, ?, ?, ?, 'pending', ?, '', '', 0, 5)`,
+			`INSERT INTO reminder_tasks (event_id, reminder_id, channel_id, channel_type, status, scheduled_at, triggered_at, last_error, retry_count, max_retries)
+			 VALUES ($1, $2, $3, $4, 'pending', $5, '', '', 0, 5)`,
+			eventID, reminderID, channelID, channelType, scheduledAt.Format(time.RFC3339),
+		)
+		return insertErr
+	}
+	existingAt, _ := time.Parse(time.RFC3339, existingScheduled)
+	if !scheduledAt.After(existingAt) {
+		return nil
+	}
+	_, updateErr := execWithDriver(ctx, db, driver,
+		`UPDATE reminder_tasks SET status = 'pending', scheduled_at = ?, triggered_at = '', last_error = '', retry_count = 0, max_retries = 5 WHERE id = ?`,
+		`UPDATE reminder_tasks SET status = 'pending', scheduled_at = $1, triggered_at = '', last_error = '', retry_count = 0, max_retries = 5 WHERE id = $2`,
+		scheduledAt.Format(time.RFC3339), taskID,
 	)
-	return err
+	return updateErr
 }
 
 func markTaskDone(ctx context.Context, db *sql.DB, driver DatabaseDriver, taskID int64, status, lastError string) error {
@@ -480,6 +548,28 @@ func markTaskDone(ctx context.Context, db *sql.DB, driver DatabaseDriver, taskID
 		`UPDATE reminder_tasks SET status = ?, triggered_at = ?, last_error = ? WHERE id = ?`,
 		`UPDATE reminder_tasks SET status = $1, triggered_at = $2, last_error = $3 WHERE id = $4`,
 		status, time.Now().Format(time.RFC3339), lastError, taskID,
+	)
+	return err
+}
+
+func claimTaskForProcessing(ctx context.Context, db *sql.DB, driver DatabaseDriver, taskID int64) (bool, error) {
+	res, err := execWithDriver(ctx, db, driver,
+		`UPDATE reminder_tasks SET status = 'processing' WHERE id = ? AND status = 'pending'`,
+		`UPDATE reminder_tasks SET status = 'processing' WHERE id = $1 AND status = 'pending'`,
+		taskID,
+	)
+	if err != nil {
+		return false, err
+	}
+	affected, _ := res.RowsAffected()
+	return affected > 0, nil
+}
+
+func markTaskRetry(ctx context.Context, db *sql.DB, driver DatabaseDriver, taskID int64, retryCount int, nextAt time.Time, lastError string) error {
+	_, err := execWithDriver(ctx, db, driver,
+		`UPDATE reminder_tasks SET status = 'pending', retry_count = ?, scheduled_at = ?, triggered_at = ?, last_error = ? WHERE id = ?`,
+		`UPDATE reminder_tasks SET status = 'pending', retry_count = $1, scheduled_at = $2, triggered_at = $3, last_error = $4 WHERE id = $5`,
+		retryCount, nextAt.Format(time.RFC3339), time.Now().Format(time.RFC3339), lastError, taskID,
 	)
 	return err
 }
@@ -500,6 +590,17 @@ func fallbackInt(value, fallback int) int {
 		return fallback
 	}
 	return value
+}
+
+func nextRetryDelay(retryCount int) time.Duration {
+	if retryCount < 1 {
+		retryCount = 1
+	}
+	seconds := 30.0 * math.Pow(2, float64(retryCount-1))
+	if seconds > 1800 {
+		seconds = 1800
+	}
+	return time.Duration(seconds) * time.Second
 }
 
 func containsInt64(list []int64, target int64) bool {
@@ -538,4 +639,118 @@ func findGroupMember(groups []NotificationGroup, memberID int64) (NotificationGr
 		}
 	}
 	return NotificationGroupMember{}, "", false
+}
+
+func computeNotifyAt(event MemoEvent, point ReminderPoint, now time.Time) (time.Time, bool) {
+	offset := time.Duration(point.OffsetMin) * time.Minute
+	switch strings.ToLower(event.RecurrenceType) {
+	case "", "once":
+		notifyAt := event.EventAt.Add(-offset)
+		return notifyAt, !notifyAt.After(now)
+	case "daily":
+		base := latestDailyOccurrence(event.EventAt, now.Add(offset))
+		notifyAt := base.Add(-offset)
+		return notifyAt, !notifyAt.After(now)
+	case "workday":
+		base := latestWorkdayOccurrence(event.EventAt, now.Add(offset))
+		notifyAt := base.Add(-offset)
+		return notifyAt, !notifyAt.After(now)
+	case "cron":
+		base, ok := latestCronOccurrence(event.RecurrenceExpr, now.Add(offset), 72*time.Hour)
+		if !ok {
+			return time.Time{}, false
+		}
+		notifyAt := base.Add(-offset)
+		return notifyAt, !notifyAt.After(now)
+	default:
+		notifyAt := event.EventAt.Add(-offset)
+		return notifyAt, !notifyAt.After(now)
+	}
+}
+
+func isExpiredOneTimeEvent(event MemoEvent, now time.Time) bool {
+	recurrence := strings.ToLower(strings.TrimSpace(event.RecurrenceType))
+	if recurrence == "" || recurrence == "once" {
+		return event.EventAt.Before(now)
+	}
+	return false
+}
+
+func latestDailyOccurrence(anchor, now time.Time) time.Time {
+	y, m, d := now.Date()
+	hh, mm, ss := anchor.Clock()
+	candidate := time.Date(y, m, d, hh, mm, ss, 0, now.Location())
+	if candidate.After(now) {
+		candidate = candidate.AddDate(0, 0, -1)
+	}
+	return candidate
+}
+
+func latestWorkdayOccurrence(anchor, now time.Time) time.Time {
+	candidate := latestDailyOccurrence(anchor, now)
+	for candidate.Weekday() == time.Saturday || candidate.Weekday() == time.Sunday {
+		candidate = candidate.AddDate(0, 0, -1)
+	}
+	return candidate
+}
+
+func latestCronOccurrence(expr string, now time.Time, lookback time.Duration) (time.Time, bool) {
+	expr = strings.TrimSpace(expr)
+	if expr == "" {
+		return time.Time{}, false
+	}
+	fields := strings.Fields(expr)
+	if len(fields) != 5 {
+		return time.Time{}, false
+	}
+	start := now.Add(-lookback).Truncate(time.Minute)
+	for t := now.Truncate(time.Minute); !t.Before(start); t = t.Add(-time.Minute) {
+		if cronMatch(fields, t) {
+			return t, true
+		}
+	}
+	return time.Time{}, false
+}
+
+func cronMatch(fields []string, t time.Time) bool {
+	return cronFieldMatch(fields[0], t.Minute(), 0, 59) &&
+		cronFieldMatch(fields[1], t.Hour(), 0, 23) &&
+		cronFieldMatch(fields[2], t.Day(), 1, 31) &&
+		cronFieldMatch(fields[3], int(t.Month()), 1, 12) &&
+		cronFieldMatch(normalizeCronWeekday(fields[4]), int(t.Weekday()), 0, 6)
+}
+
+func normalizeCronWeekday(field string) string {
+	return strings.ReplaceAll(field, "7", "0")
+}
+
+func cronFieldMatch(pattern string, value, min, max int) bool {
+	parts := strings.Split(pattern, ",")
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "*" {
+			return true
+		}
+		if strings.HasPrefix(part, "*/") {
+			step, err := strconv.Atoi(strings.TrimPrefix(part, "*/"))
+			if err == nil && step > 0 && value%step == 0 {
+				return true
+			}
+			continue
+		}
+		if strings.Contains(part, "-") {
+			rangeParts := strings.SplitN(part, "-", 2)
+			start, err1 := strconv.Atoi(rangeParts[0])
+			end, err2 := strconv.Atoi(rangeParts[1])
+			if err1 == nil && err2 == nil && value >= start && value <= end {
+				return true
+			}
+			continue
+		}
+		num, err := strconv.Atoi(part)
+		if err == nil && num >= min && num <= max && value == num {
+			return true
+		}
+	}
+	return false
 }

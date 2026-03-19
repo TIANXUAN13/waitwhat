@@ -6,6 +6,10 @@ on:
       - 'v*'
   workflow_dispatch:
     inputs:
+      image_tag:
+        description: '手动发布时的镜像标签（例如 dev、test、v1.2.3）'
+        required: false
+        default: ''
       push_latest:
         description: '是否附带 latest 标签'
         required: false
@@ -41,6 +45,7 @@ jobs:
           tags: |
             type=ref,event=tag
             type=sha
+            type=raw,value=${{ inputs.image_tag }},enable=${{ github.event_name == 'workflow_dispatch' && inputs.image_tag != '' }}
             type=raw,value=latest,enable=${{ github.event_name == 'push' || inputs.push_latest == 'true' }}
 
       - name: Build and push

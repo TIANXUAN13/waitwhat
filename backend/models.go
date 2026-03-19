@@ -80,6 +80,7 @@ type NotificationGroupMember struct {
 	Label   string `json:"label"`
 	Target  string `json:"target"`
 	Secret  string `json:"-"`
+	Keyword string `json:"keyword"`
 	UseSign bool   `json:"useSign"`
 	Enabled bool   `json:"enabled"`
 }
@@ -243,6 +244,13 @@ type SaveDingTalkConfigRequest struct {
 	Keyword string `json:"keyword"`
 }
 
+type SendTestDingTalkRequest struct {
+	Webhook string `json:"webhook"`
+	Secret  string `json:"secret"`
+	Keyword string `json:"keyword"`
+	UseSign bool   `json:"useSign"`
+}
+
 type SaveNotificationGroupRequest struct {
 	ID      int64                            `json:"id"`
 	Name    string                           `json:"name"`
@@ -255,6 +263,7 @@ type SaveNotificationGroupMemberReq struct {
 	Label   string `json:"label"`
 	Target  string `json:"target"`
 	Secret  string `json:"secret"`
+	Keyword string `json:"keyword"`
 	UseSign bool   `json:"useSign"`
 	Enabled bool   `json:"enabled"`
 }

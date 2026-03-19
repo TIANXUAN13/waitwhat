@@ -63,6 +63,7 @@ export interface NotificationGroupMember {
   type: 'email' | 'dingtalk_webhook'
   label: string
   target: string
+  keyword: string
   useSign: boolean
   enabled: boolean
 }

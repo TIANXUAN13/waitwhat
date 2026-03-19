@@ -34,6 +34,7 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("/api/mail/test", s.handleMailTest)
 	mux.HandleFunc("/api/mail/diagnose", s.handleMailDiagnose)
 	mux.HandleFunc("/api/dingtalk/config", s.handleDingTalkConfig)
+	mux.HandleFunc("/api/dingtalk/test", s.handleDingTalkTest)
 	mux.HandleFunc("/api/reminders/dispatch", s.handleDispatchReminders)
 	mux.HandleFunc("/api/notify-groups", s.handleNotifyGroups)
 	mux.HandleFunc("/api/notify-groups/", s.handleNotifyGroupByID)
@@ -307,6 +308,28 @@ func (s *Server) handleDingTalkConfig(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (s *Server) handleDingTalkTest(w http.ResponseWriter, r *http.Request) {
+	if _, err := s.requireAuth(r); err != nil {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": err.Error()})
+		return
+	}
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+
+	var req SendTestDingTalkRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求体解析失败"})
+		return
+	}
+	if err := s.repo.SendTestDingTalkWebhook(r.Context(), req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"message": "钉钉测试消息已发送"})
+}
+
 func (s *Server) handleNotifyGroups(w http.ResponseWriter, r *http.Request) {
 	user, err := s.requireAuth(r)
 	if err != nil {
@@ -464,8 +487,13 @@ func bearerToken(r *http.Request) string {
 }
 
 func withCORS(next http.Handler) http.Handler {
+	allowOrigin := envOrDefault("APP_CORS_ALLOW_ORIGIN", "*")
+	if strings.TrimSpace(allowOrigin) == "" {
+		allowOrigin = "*"
+	}
+
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Origin", allowOrigin)
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
 		if r.Method == http.MethodOptions {

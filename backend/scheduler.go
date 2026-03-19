@@ -67,7 +67,7 @@ func (r *Repository) SendTestMail(ctx context.Context, userID int64, to string) 
 		return err
 	}
 	mailer := r.mailerFactory(cfg)
-	subject := "WaitWhat Memo SMTP 测试邮件"
+	subject := "WaitWhat SMTP 测试邮件"
 	body := strings.Join([]string{
 		"这是一封测试邮件。",
 		"",
@@ -104,6 +104,25 @@ func (r *Repository) SaveDingTalkConfig(ctx context.Context, userID int64, req S
 		return DingTalkConfig{}, err
 	}
 	return cfg.Safe(), nil
+}
+
+func (r *Repository) SendTestDingTalkWebhook(ctx context.Context, req SendTestDingTalkRequest) error {
+	cfg := DingTalkConfig{
+		Enabled: true,
+		Webhook: strings.TrimSpace(req.Webhook),
+		Secret:  strings.TrimSpace(req.Secret),
+		UseSign: req.UseSign,
+		Keyword: firstNonEmpty(strings.TrimSpace(req.Keyword), "测试"),
+	}
+	if cfg.Webhook == "" {
+		return errors.New("钉钉 webhook 不能为空")
+	}
+	if cfg.UseSign && cfg.Secret == "" {
+		return errors.New("启用加签时必须填写 secret")
+	}
+	_ = ctx
+	sender := r.dingFactory(cfg)
+	return sender.Send("WaitWhat 测试消息", "这是一条测试消息，用于验证通知组中的钉钉渠道配置。")
 }
 
 func (r *Repository) DispatchDueReminders(ctx context.Context) (ReminderDispatchResult, error) {
@@ -306,7 +325,7 @@ func (r *Repository) sendEventEmail(ctx context.Context, db *sql.DB, to string, 
 		fmt.Sprintf("事件时间: %s", event.EventAt.Format("2006-01-02 15:04:05")),
 		fmt.Sprintf("当前提醒: %s", point.Label),
 		"",
-		"这是 WaitWhat Memo 自动发送的提醒邮件。",
+		"这是 WaitWhat 自动发送的提醒邮件。",
 	}, "\n")
 	return mailer.Send(to, subject, body)
 }
@@ -333,7 +352,7 @@ func (r *Repository) sendEventDingTalkWebhook(member NotificationGroupMember, ev
 		Webhook: member.Target,
 		Secret:  member.Secret,
 		UseSign: member.UseSign,
-		Keyword: "提醒",
+		Keyword: firstNonEmpty(strings.TrimSpace(member.Keyword), "提醒"),
 	}
 	sender := r.dingFactory(cfg)
 	title := fmt.Sprintf("提醒: %s", event.Title)

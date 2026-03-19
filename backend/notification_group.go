@@ -73,6 +73,7 @@ func (r *Repository) SaveNotificationGroup(ctx context.Context, userID int64, re
 	for _, member := range req.Members {
 		memberType := strings.TrimSpace(member.Type)
 		target := strings.TrimSpace(member.Target)
+		keyword := strings.TrimSpace(member.Keyword)
 		label := firstNonEmpty(member.Label, target, memberType)
 		if memberType == "" || target == "" {
 			return NotificationGroup{}, errors.New("通知组成员类型和目标不能为空")
@@ -80,10 +81,13 @@ func (r *Repository) SaveNotificationGroup(ctx context.Context, userID int64, re
 		if memberType != "email" && memberType != "dingtalk_webhook" {
 			return NotificationGroup{}, errors.New("通知组成员类型不支持")
 		}
+		if memberType != "dingtalk_webhook" {
+			keyword = ""
+		}
 		if _, err := execWithDriver(ctx, tx, r.cfg.Database.SelectedDriver,
-			`INSERT INTO notification_group_members (group_id, type, label, target, secret, use_sign, enabled) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-			`INSERT INTO notification_group_members (group_id, type, label, target, secret, use_sign, enabled) VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-			groupID, memberType, label, target, member.Secret, boolToInt(member.UseSign), boolToInt(member.Enabled),
+			`INSERT INTO notification_group_members (group_id, type, label, target, secret, keyword, use_sign, enabled) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+			`INSERT INTO notification_group_members (group_id, type, label, target, secret, keyword, use_sign, enabled) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+			groupID, memberType, label, target, member.Secret, keyword, boolToInt(member.UseSign), boolToInt(member.Enabled),
 		); err != nil {
 			return NotificationGroup{}, err
 		}

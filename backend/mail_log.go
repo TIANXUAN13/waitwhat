@@ -9,7 +9,6 @@ import (
 )
 
 const (
-	mailLogDir     = "./data/logs"
 	mailLogFile    = "mail.log"
 	mailLogMaxSize = 10 * 1024 * 1024
 	mailLogBackup  = "mail.log.1"
@@ -21,9 +20,10 @@ func writeMailLog(format string, args ...any) {
 	mailLoggerMu.Lock()
 	defer mailLoggerMu.Unlock()
 
-	logPath := filepath.Join(mailLogDir, mailLogFile)
-	backupPath := filepath.Join(mailLogDir, mailLogBackup)
-	if err := os.MkdirAll(mailLogDir, 0o755); err != nil {
+	logDir := filepath.Join(dataDir(), "logs")
+	logPath := filepath.Join(logDir, mailLogFile)
+	backupPath := filepath.Join(logDir, mailLogBackup)
+	if err := os.MkdirAll(logDir, 0o755); err != nil {
 		return
 	}
 
@@ -40,4 +40,11 @@ func writeMailLog(format string, args ...any) {
 
 	line := fmt.Sprintf("%s %s\n", time.Now().Format("2006-01-02 15:04:05"), fmt.Sprintf(format, args...))
 	_, _ = f.WriteString(line)
+}
+
+func dataDir() string {
+	if dir := os.Getenv("APP_DATA_DIR"); dir != "" {
+		return dir
+	}
+	return "./data"
 }

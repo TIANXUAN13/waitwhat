@@ -125,7 +125,7 @@ func (r *Repository) InitDatabase(ctx context.Context, req InitDatabaseRequest) 
 		return DatabaseConfig{}, errors.New("不支持的数据库类型")
 	}
 
-	next := AppConfig{Database: cfg, Mail: r.cfg.Mail, DingTalk: r.cfg.DingTalk}
+	next := AppConfig{Database: cfg, Mail: r.cfg.Mail, DingTalk: r.cfg.DingTalk, Auth: r.cfg.Auth}
 	db, err := openDBFromConfig(next.Database)
 	if err != nil {
 		return DatabaseConfig{}, err
@@ -868,9 +868,9 @@ func loadNotificationGroups(ctx context.Context, db *sql.DB, driver DatabaseDriv
 }
 
 func loadNotificationGroupMembers(ctx context.Context, db *sql.DB, driver DatabaseDriver, groupID int64) ([]NotificationGroupMember, error) {
-	query := `SELECT id, group_id, type, label, target, secret, use_sign, enabled FROM notification_group_members WHERE group_id = ? ORDER BY id`
+	query := `SELECT id, group_id, type, label, target, secret, keyword, use_sign, enabled FROM notification_group_members WHERE group_id = ? ORDER BY id`
 	if driver == DriverPG {
-		query = `SELECT id, group_id, type, label, target, secret, use_sign, enabled FROM notification_group_members WHERE group_id = $1 ORDER BY id`
+		query = `SELECT id, group_id, type, label, target, secret, keyword, use_sign, enabled FROM notification_group_members WHERE group_id = $1 ORDER BY id`
 	}
 	rows, err := db.QueryContext(ctx, query, groupID)
 	if err != nil {
@@ -882,7 +882,7 @@ func loadNotificationGroupMembers(ctx context.Context, db *sql.DB, driver Databa
 	for rows.Next() {
 		var item NotificationGroupMember
 		var useSign, enabled int
-		if err := rows.Scan(&item.ID, &item.GroupID, &item.Type, &item.Label, &item.Target, &item.Secret, &useSign, &enabled); err != nil {
+		if err := rows.Scan(&item.ID, &item.GroupID, &item.Type, &item.Label, &item.Target, &item.Secret, &item.Keyword, &useSign, &enabled); err != nil {
 			return nil, err
 		}
 		item.UseSign = useSign == 1
@@ -1062,9 +1062,11 @@ var sqliteSchema = []string{
 		label TEXT NOT NULL,
 		target TEXT NOT NULL,
 		secret TEXT NOT NULL DEFAULT '',
+		keyword TEXT NOT NULL DEFAULT '',
 		use_sign INTEGER NOT NULL DEFAULT 0,
 		enabled INTEGER NOT NULL DEFAULT 1
 	)`,
+	`ALTER TABLE notification_group_members ADD COLUMN keyword TEXT NOT NULL DEFAULT ''`,
 }
 
 var postgresSchema = []string{
@@ -1170,7 +1172,9 @@ var postgresSchema = []string{
 		label TEXT NOT NULL,
 		target TEXT NOT NULL,
 		secret TEXT NOT NULL DEFAULT '',
+		keyword TEXT NOT NULL DEFAULT '',
 		use_sign INTEGER NOT NULL DEFAULT 0,
 		enabled INTEGER NOT NULL DEFAULT 1
 	)`,
+	`ALTER TABLE notification_group_members ADD COLUMN IF NOT EXISTS keyword TEXT NOT NULL DEFAULT ''`,
 }

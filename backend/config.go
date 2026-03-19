@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"time"
 )
 
 const defaultSQLitePath = "./data/waitwhat.sqlite"
@@ -70,6 +71,15 @@ func loadConfig() (AppConfig, error) {
 	}
 	if cfg.Database.SQLitePath == "" {
 		cfg.Database.SQLitePath = defaultSQLitePath
+	}
+	// Backward-compat: older config may have no initializedAt while DB file already exists.
+	if cfg.Database.InitializedAt.IsZero() && cfg.Database.SelectedDriver == DriverSQLite {
+		sqlitePath := cfg.Database.SQLitePath
+		if info, err := os.Stat(sqlitePath); err == nil && !info.IsDir() {
+			cfg.Database.InitializedAt = info.ModTime()
+		} else if _, err := os.Stat(defaultSQLitePath); err == nil {
+			cfg.Database.InitializedAt = time.Now()
+		}
 	}
 	if cfg.Auth.TokenSecret == "" {
 		cfg.Auth.TokenSecret = randomSecret()

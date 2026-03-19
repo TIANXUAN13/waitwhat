@@ -145,7 +145,7 @@ func TestDispatchDueRemindersWithMockMailer(t *testing.T) {
 		Port:        587,
 		Username:    "tester@example.com",
 		Password:    "secret",
-		FromName:    "WaitWhat Memo",
+		FromName:    "WaitWhat",
 		FromAddress: "tester@example.com",
 		UseTLS:      false,
 	}); err != nil {
@@ -234,7 +234,7 @@ func TestSendTestMailWithMockMailer(t *testing.T) {
 		Port:        587,
 		Username:    "tester@example.com",
 		Password:    "secret",
-		FromName:    "WaitWhat Memo",
+		FromName:    "WaitWhat",
 		FromAddress: "tester@example.com",
 		UseTLS:      false,
 	}); err != nil {

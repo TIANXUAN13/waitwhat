@@ -1,6 +1,6 @@
 import type { AppState, AuthUser, DatabaseDriver } from './types'
 
-const API_BASE = 'http://localhost:8080/api'
+const API_BASE = (import.meta.env.VITE_API_BASE as string | undefined) ?? 'http://localhost:8080/api'
 const TOKEN_KEY = 'waitwhat-auth-token'
 
 function authHeaders() {
@@ -106,6 +106,7 @@ export interface SaveNotifyGroupPayload {
     label: string
     target: string
     secret?: string
+    keyword?: string
     useSign: boolean
     enabled: boolean
   }>
@@ -193,6 +194,10 @@ export async function dispatchReminders() {
 
 export async function saveDingTalkConfig(payload: SaveDingTalkConfigPayload) {
   return request('/dingtalk/config', { method: 'POST', body: JSON.stringify(payload) })
+}
+
+export async function sendTestDingTalk(payload: { webhook: string; secret: string; keyword?: string; useSign: boolean }) {
+  return request('/dingtalk/test', { method: 'POST', body: JSON.stringify(payload) })
 }
 
 export async function saveNotifyGroup(payload: SaveNotifyGroupPayload) {

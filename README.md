@@ -1,4 +1,4 @@
-# WaitWhat Memo
+# WaitWhat
 
 一个支持倒计时提醒、预提醒、多通知渠道的备忘录 Web 应用。
 
@@ -34,6 +34,7 @@ go run .
 
 - `APP_PORT`: 服务端口，默认 `8080`
 - `APP_DATA_DIR`: SQLite 数据目录，默认 `./data`
+- `APP_CORS_ALLOW_ORIGIN`: CORS 允许来源，默认 `*`
 
 ## 前端启动
 
@@ -44,6 +45,10 @@ npm run dev
 ```
 
 默认启动地址：`http://localhost:5173`
+
+可选环境变量：
+
+- `VITE_API_BASE`: 前端 API 基地址，默认 `http://localhost:8080/api`
 
 ## 一键启动
 

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import {
   clearToken,
   createEvent,
@@ -15,10 +15,10 @@ import {
   logout as apiLogout,
   register,
   resetDatabase,
-  saveDingTalkConfig,
   saveMailConfig,
   saveNotifyGroup,
   saveToken,
+  sendTestDingTalk,
   sendTestMail,
   setupAdmin,
   updateEvent
@@ -32,10 +32,11 @@ interface ReminderOption {
   selected: boolean
 }
 
-type ViewMode = 'composer' | 'list' | 'settings'
+type ViewMode = 'composer' | 'list' | 'notify' | 'settings'
 type AuthMode = 'login' | 'register'
 
 const SETTINGS_KEY = 'waitwhat-ui-settings'
+const LOGIN_READY_HINT_SEEN_KEY = 'waitwhat-login-ready-hint-seen'
 
 const loading = ref(true)
 const submitting = ref(false)
@@ -43,7 +44,6 @@ const creating = ref(false)
 const savingMail = ref(false)
 const testingMail = ref(false)
 const diagnosingMail = ref(false)
-const savingDingTalk = ref(false)
 const dispatching = ref(false)
 const savingUi = ref(false)
 const authSubmitting = ref(false)
@@ -51,10 +51,11 @@ const errorMessage = ref('')
 const successMessage = ref('')
 const appState = ref<AppState | null>(null)
 const currentView = ref<ViewMode>('composer')
+const listFocus = ref<'pending' | 'expired'>('pending')
 const authMode = ref<AuthMode>('login')
 const editingEventId = ref<number | null>(null)
+const showLoginReadyHint = ref(false)
 const showMailConfig = ref(true)
-const showDingTalkConfig = ref(false)
 const showResetInit = computed(() => /no such column|SQL logic error|database/i.test(errorMessage.value))
 
 const dbForm = reactive({
@@ -83,7 +84,7 @@ const authForm = reactive({
 })
 
 const uiSettings = reactive({
-  projectName: 'WaitWhat Memo',
+  projectName: 'WaitWhat',
   slogan: '清新的提醒工作台',
   displayName: 'Chen',
   displaySubTitle: '专注你的每个关键节点'
@@ -112,28 +113,33 @@ const mailForm = reactive({
   port: 587,
   username: '',
   password: '',
-  fromName: 'WaitWhat Memo',
+  fromName: 'WaitWhat',
   fromAddress: '',
   useTls: true,
   useSsl: false
 })
 
-const dingTalkForm = reactive({
-  enabled: false,
-  webhook: '',
-  secret: '',
-  useSign: false,
-  keyword: '提醒'
-})
-
 const mailPasswordSaved = ref(false)
 const mailDiagnosis = ref<{ host: string; steps: Array<{ port: number; mode: string; step: string; ok: boolean; latencyMs: number; error?: string }> } | null>(null)
 const savingGroup = ref(false)
+const groupQuery = ref('')
+const notifyEditorVisible = ref(false)
+const applyingUrlState = ref(false)
+const testingMemberKey = ref('')
+const memberTestStatus = reactive<Record<string, { state: 'idle' | 'sending' | 'success' | 'error'; message: string }>>({})
+const confirmState = reactive({
+  visible: false,
+  title: '',
+  message: '',
+  confirmText: '确定',
+  cancelText: '取消',
+  resolve: null as null | ((confirmed: boolean) => void)
+})
 const groupForm = reactive({
   id: 0,
   name: '',
   enabled: true,
-  members: [{ type: 'email' as 'email' | 'dingtalk_webhook', label: '默认邮箱', target: '', secret: '', useSign: false, enabled: true }]
+  members: [{ type: 'email' as 'email' | 'dingtalk_webhook', label: '默认邮箱', target: '', secret: '', keyword: '提醒', useSign: false, enabled: true }]
 })
 
 function isRealInitializedAt(value?: string) {
@@ -148,6 +154,26 @@ const notifyGroups = computed<NotificationGroup[]>(() => appState.value?.notifyG
 const events = computed(() => appState.value?.events ?? [])
 const tasks = computed(() => appState.value?.tasks ?? [])
 const logs = computed(() => appState.value?.logs ?? [])
+const pendingEvents = computed(() =>
+  events.value
+    .filter((event) => new Date(event.eventAt).getTime() >= Date.now())
+    .sort((a, b) => new Date(a.eventAt).getTime() - new Date(b.eventAt).getTime())
+)
+const expiredEvents = computed(() =>
+  events.value
+    .filter((event) => new Date(event.eventAt).getTime() < Date.now())
+    .sort((a, b) => new Date(b.eventAt).getTime() - new Date(a.eventAt).getTime())
+)
+const filteredNotifyGroups = computed(() => {
+  const keyword = groupQuery.value.trim().toLowerCase()
+  if (!keyword) return notifyGroups.value
+  return notifyGroups.value.filter((group) => {
+    if (group.name.toLowerCase().includes(keyword)) return true
+    return group.members.some((member) => member.label.toLowerCase().includes(keyword) || member.target.toLowerCase().includes(keyword))
+  })
+})
+const groupDraftSnapshot = ref('')
+const isGroupDirty = computed(() => groupDraftSnapshot.value !== serializeGroupDraft())
 
 const selectedReminderSummary = computed(() => {
   const items = reminderOptions.filter((item) => item.selected).map((item) => item.label)
@@ -166,7 +192,6 @@ const summaryStats = computed(() => ({
 }))
 
 const emailReady = computed(() => Boolean(mailForm.enabled && mailForm.host && mailForm.fromAddress))
-const dingTalkReady = computed(() => Boolean(dingTalkForm.enabled && dingTalkForm.webhook))
 
 function resetMessages() {
   errorMessage.value = ''
@@ -232,6 +257,39 @@ function toggleGroup(id: number) {
     : [...selectedGroupIds.value, id]
 }
 
+function openConfirm(message: string, title = '请确认') {
+  return new Promise<boolean>((resolve) => {
+    confirmState.title = title
+    confirmState.message = message
+    confirmState.visible = true
+    confirmState.resolve = resolve
+  })
+}
+
+function closeConfirm(confirmed: boolean) {
+  if (confirmState.resolve) {
+    confirmState.resolve(confirmed)
+  }
+  confirmState.visible = false
+  confirmState.resolve = null
+}
+
+async function switchView(nextView: ViewMode) {
+  if (nextView === currentView.value) return
+  if (currentView.value === 'notify' && notifyEditorVisible.value && isGroupDirty.value) {
+    const ok = await openConfirm('当前通知组有未保存修改，确定要离开并放弃这些修改吗？')
+    if (!ok) return
+  }
+  if (nextView === 'list' && currentView.value !== 'list') {
+    listFocus.value = 'pending'
+  }
+  currentView.value = nextView
+  if (nextView !== 'notify') {
+    notifyEditorVisible.value = false
+    resetGroupForm()
+  }
+}
+
 function toApiDateTime(value: string) {
   return value ? `${value}:00+08:00` : ''
 }
@@ -260,6 +318,16 @@ async function loadData() {
     }
     appState.value = await fetchBootstrap()
     if (appState.value) {
+      const shouldShowLoginReadyHint =
+        isRealInitializedAt(appState.value.database.initializedAt) &&
+        appState.value.auth.adminExists &&
+        !appState.value.auth.currentUser &&
+        localStorage.getItem(LOGIN_READY_HINT_SEEN_KEY) !== '1'
+      showLoginReadyHint.value = shouldShowLoginReadyHint
+      if (shouldShowLoginReadyHint) {
+        localStorage.setItem(LOGIN_READY_HINT_SEEN_KEY, '1')
+      }
+
       if (!appState.value.auth.currentUser && meUser) {
         appState.value.auth.currentUser = meUser
       }
@@ -281,10 +349,6 @@ async function loadData() {
       mailForm.useTls = appState.value.mail.useTls
       mailForm.useSsl = appState.value.mail.useSsl
       reminderDraft.testMailTo = ''
-      dingTalkForm.enabled = appState.value.dingTalk.enabled
-      dingTalkForm.webhook = appState.value.dingTalk.webhook || ''
-      dingTalkForm.useSign = appState.value.dingTalk.useSign
-      dingTalkForm.keyword = appState.value.dingTalk.keyword || '提醒'
       selectedGroupIds.value = (appState.value.notifyGroups ?? []).filter((group) => group.enabled).map((group) => group.id)
       if (currentUser.value) {
         uiSettings.displayName = currentUser.value.name || currentUser.value.username
@@ -328,6 +392,8 @@ async function restartInitialization() {
     dbForm.pgUser = 'postgres'
     dbForm.pgPassword = ''
     dbForm.pgSslMode = 'disable'
+    localStorage.removeItem(LOGIN_READY_HINT_SEEN_KEY)
+    showLoginReadyHint.value = false
     successMessage.value = '已返回数据库初始化，请重新配置。'
     await loadData()
   } catch (error) {
@@ -416,7 +482,7 @@ async function submitEvent() {
       successMessage.value = '事件已经写入数据库。'
     }
     editingEventId.value = null
-    currentView.value = 'list'
+    switchView('list')
     await loadData()
   } catch (error) {
     errorMessage.value = normalizeErrorMessage(error, '事件创建失败')
@@ -426,7 +492,7 @@ async function submitEvent() {
 }
 
 function beginEdit(event: AppState['events'][number]) {
-  currentView.value = 'composer'
+  switchView('composer')
   editingEventId.value = event.id
   reminderDraft.title = event.title
   reminderDraft.content = event.content
@@ -521,29 +587,38 @@ async function runDispatch() {
   }
 }
 
-async function submitDingTalkConfig() {
-  savingDingTalk.value = true
-  resetMessages()
-  try {
-    await saveDingTalkConfig({ ...dingTalkForm })
-    successMessage.value = '钉钉机器人配置已保存。'
-    await loadData()
-  } catch (error) {
-    errorMessage.value = normalizeErrorMessage(error, '钉钉配置保存失败')
-  } finally {
-    savingDingTalk.value = false
-  }
-}
-
 function resetGroupForm() {
   groupForm.id = 0
   groupForm.name = ''
   groupForm.enabled = true
-  groupForm.members = [{ type: 'email', label: '默认邮箱', target: '', secret: '', useSign: false, enabled: true }]
+  groupForm.members = [{ type: 'email', label: '默认邮箱', target: '', secret: '', keyword: '提醒', useSign: false, enabled: true }]
 }
 
 function addGroupMember() {
-  groupForm.members.push({ type: 'email', label: '', target: '', secret: '', useSign: false, enabled: true })
+  groupForm.members.push({ type: 'email', label: '', target: '', secret: '', keyword: '提醒', useSign: false, enabled: true })
+}
+
+function serializeGroupDraft() {
+  return JSON.stringify({
+    id: groupForm.id,
+    name: groupForm.name.trim(),
+    enabled: groupForm.enabled,
+    members: groupForm.members.map((member) => ({
+      type: member.type,
+      label: member.label.trim(),
+      target: member.target.trim(),
+      secret: member.secret.trim(),
+      keyword: member.keyword.trim(),
+      useSign: member.useSign,
+      enabled: member.enabled
+    }))
+  })
+}
+
+function createGroup() {
+  resetGroupForm()
+  notifyEditorVisible.value = true
+  groupDraftSnapshot.value = serializeGroupDraft()
 }
 
 function editGroup(group: NotificationGroup) {
@@ -555,9 +630,120 @@ function editGroup(group: NotificationGroup) {
     label: m.label,
     target: m.target,
     secret: '',
+    keyword: m.keyword || '提醒',
     useSign: m.useSign,
     enabled: m.enabled
   }))
+  notifyEditorVisible.value = true
+  groupDraftSnapshot.value = serializeGroupDraft()
+}
+
+function routeHash() {
+  return window.location.hash || '#/composer'
+}
+
+function parseHash(hash: string) {
+  const raw = hash.startsWith('#') ? hash.slice(1) : hash
+  const [pathPart, queryPart = ''] = raw.split('?')
+  const params = new URLSearchParams(queryPart)
+  return {
+    path: pathPart || '/composer',
+    params
+  }
+}
+
+function setHash(hash: string, replace = false) {
+  if (replace) {
+    window.history.replaceState(null, '', hash)
+    return
+  }
+  window.history.pushState(null, '', hash)
+}
+
+function syncRouteFromState(replace = false) {
+  if (applyingUrlState.value) return
+  let hash = '#/composer'
+  if (currentView.value === 'list') {
+    hash = `#/list?tab=${listFocus.value}`
+  } else if (currentView.value === 'settings') {
+    hash = '#/settings'
+  } else if (currentView.value === 'notify') {
+    if (notifyEditorVisible.value) {
+      hash = groupForm.id ? `#/notify/group/${groupForm.id}` : '#/notify/group/new'
+    } else {
+      hash = '#/notify'
+    }
+  }
+  if (routeHash() !== hash) {
+    setHash(hash, replace)
+  }
+}
+
+async function applyRouteToState() {
+  const { path, params } = parseHash(routeHash())
+
+  const leavingDirtyNotify =
+    currentView.value === 'notify' &&
+    notifyEditorVisible.value &&
+    isGroupDirty.value &&
+    !path.startsWith('/notify/group/')
+  if (leavingDirtyNotify) {
+    const ok = await openConfirm('当前通知组有未保存修改，确定要离开并放弃这些修改吗？')
+    if (!ok) {
+      syncRouteFromState(true)
+      return
+    }
+  }
+
+  applyingUrlState.value = true
+  if (path === '/composer') {
+    currentView.value = 'composer'
+    notifyEditorVisible.value = false
+    resetGroupForm()
+  } else if (path === '/list') {
+    currentView.value = 'list'
+    const tab = params.get('tab')
+    listFocus.value = tab === 'expired' ? 'expired' : 'pending'
+    notifyEditorVisible.value = false
+    resetGroupForm()
+  } else if (path === '/settings') {
+    currentView.value = 'settings'
+    notifyEditorVisible.value = false
+    resetGroupForm()
+  } else if (path === '/notify') {
+    currentView.value = 'notify'
+    notifyEditorVisible.value = false
+    resetGroupForm()
+  } else if (path === '/notify/group/new') {
+    currentView.value = 'notify'
+    createGroup()
+  } else if (path.startsWith('/notify/group/')) {
+    currentView.value = 'notify'
+    const idText = path.replace('/notify/group/', '')
+    const groupID = Number(idText)
+    const target = Number.isFinite(groupID) ? notifyGroups.value.find((group) => group.id === groupID) : undefined
+    if (target) {
+      editGroup(target)
+    } else {
+      notifyEditorVisible.value = false
+      resetGroupForm()
+    }
+  } else {
+    currentView.value = 'composer'
+    notifyEditorVisible.value = false
+    resetGroupForm()
+    syncRouteFromState(true)
+  }
+  applyingUrlState.value = false
+}
+
+async function closeGroupEditor() {
+  if (isGroupDirty.value) {
+    const ok = await openConfirm('当前通知组有未保存修改，是否放弃变更并退出？')
+    if (!ok) return
+  }
+  notifyEditorVisible.value = false
+  resetGroupForm()
 }
 
 async function submitNotifyGroup() {
@@ -566,8 +752,10 @@ async function submitNotifyGroup() {
   try {
     await saveNotifyGroup({ ...groupForm })
     successMessage.value = '通知组已保存。'
+    notifyEditorVisible.value = false
     resetGroupForm()
     await loadData()
+    currentView.value = 'notify'
   } catch (error) {
     errorMessage.value = normalizeErrorMessage(error, '通知组保存失败')
   } finally {
@@ -578,9 +766,13 @@ async function submitNotifyGroup() {
 async function removeGroup(id: number) {
   resetMessages()
   try {
+    const target = notifyGroups.value.find((group) => group.id === id)
+    const confirmed = await openConfirm(`确定删除通知组「${target?.name ?? id}」吗？`, '删除通知组')
+    if (!confirmed) return
     await deleteNotifyGroup(id)
     successMessage.value = '通知组已删除。'
-    if (groupForm.id === id) {
+    if (groupForm.id === id && notifyEditorVisible.value) {
+      notifyEditorVisible.value = false
       resetGroupForm()
     }
     await loadData()
@@ -589,9 +781,53 @@ async function removeGroup(id: number) {
   }
 }
 
+async function testGroupMember(member: { type: 'email' | 'dingtalk_webhook'; target: string; secret: string; keyword: string; useSign: boolean }, idx: number) {
+  resetMessages()
+  const key = `${member.type}-${idx}`
+  testingMemberKey.value = key
+  memberTestStatus[key] = { state: 'sending', message: '发送中...' }
+  try {
+    if (member.type === 'email') {
+      await sendTestMail(member.target)
+      successMessage.value = '邮箱测试消息已发送，请检查收件箱（含“测试”内容）。'
+      memberTestStatus[key] = { state: 'success', message: '邮箱测试发送成功' }
+    } else {
+      await sendTestDingTalk({
+        webhook: member.target,
+        secret: member.secret,
+        keyword: member.keyword,
+        useSign: member.useSign
+      })
+      successMessage.value = '钉钉测试消息已发送（含“测试”内容）。'
+      memberTestStatus[key] = { state: 'success', message: '钉钉测试发送成功' }
+    }
+  } catch (error) {
+    errorMessage.value = normalizeErrorMessage(error, '测试消息发送失败')
+    memberTestStatus[key] = { state: 'error', message: errorMessage.value || '发送失败' }
+  } finally {
+    testingMemberKey.value = ''
+  }
+}
+
 onMounted(async () => {
   loadUiSettings()
   await loadData()
+  applyRouteToState()
+  window.addEventListener('hashchange', applyRouteToState)
+})
+
+onBeforeUnmount(() => {
+  window.removeEventListener('hashchange', applyRouteToState)
+})
+
+watch([currentView, notifyEditorVisible, () => groupForm.id], () => {
+  syncRouteFromState()
+})
+
+watch(listFocus, () => {
+  if (currentView.value === 'list') {
+    syncRouteFromState()
+  }
 })
 </script>
 
@@ -602,7 +838,7 @@ onMounted(async () => {
 
     <div v-if="loading" class="center-shell">
       <div class="auth-card">
-        <p class="eyebrow">WaitWhat Memo</p>
+        <p class="eyebrow">WaitWhat</p>
         <h1>正在准备你的提醒工作台</h1>
         <p class="muted-copy">加载数据库状态、用户体系和提醒数据中...</p>
       </div>
@@ -673,7 +909,7 @@ onMounted(async () => {
       <div class="auth-card">
         <p class="eyebrow">Welcome</p>
         <h1>{{ uiSettings.projectName }}</h1>
-        <p class="muted-copy">管理员已设置完成。现在可以登录，或者注册普通用户再进入工作台。</p>
+        <p v-if="showLoginReadyHint" class="muted-copy">管理员已设置完成。现在可以登录，或者注册普通用户再进入工作台。</p>
         <div class="pill-switch">
           <button :class="['pill-btn', authMode === 'login' && 'active']" @click="authMode = 'login'">登录</button>
           <button :class="['pill-btn', authMode === 'register' && 'active']" @click="authMode = 'register'">注册</button>
@@ -702,12 +938,13 @@ onMounted(async () => {
           </div>
         </div>
         <nav class="nav-pill">
-          <button :class="['nav-btn', currentView === 'composer' && 'active']" @click="currentView = 'composer'">备忘录模块</button>
-          <button :class="['nav-btn', currentView === 'list' && 'active']" @click="currentView = 'list'">备忘录列表</button>
-          <button :class="['nav-btn', currentView === 'settings' && 'active']" @click="currentView = 'settings'">设置</button>
+          <button :class="['nav-btn', currentView === 'composer' && 'active']" @click="switchView('composer')">创建备忘录</button>
+          <button :class="['nav-btn', currentView === 'list' && 'active']" @click="switchView('list')">备忘录列表</button>
+          <button :class="['nav-btn', currentView === 'notify' && 'active']" @click="switchView('notify')">通知相关</button>
+          <button :class="['nav-btn', currentView === 'settings' && 'active']" @click="switchView('settings')">设置</button>
         </nav>
         <div class="account-box">
-          <button class="icon-btn" @click="currentView = 'settings'">设置</button>
+          <button class="icon-btn" @click="switchView('settings')">设置</button>
           <button class="icon-btn" @click="handleLogout">登出</button>
         </div>
       </header>
@@ -777,22 +1014,130 @@ onMounted(async () => {
           </section>
 
           <section v-else-if="currentView === 'list'" class="content-panel glass-panel">
-            <div class="panel-head align-center"><div><p class="section-label">Timeline</p><h2>备忘录与任务列表</h2></div><button class="secondary-btn" :disabled="dispatching" @click="runDispatch">{{ dispatching ? '扫描中...' : '立即扫描提醒' }}</button></div>
-            <div class="list-stack">
-              <article class="memo-card" v-for="event in events" :key="event.id">
-                <div class="memo-header"><div><h3>{{ event.title }}</h3><p>{{ event.content }}</p></div><span class="countdown-badge">{{ event.countdownLabel }}</span></div>
-                <div class="meta-row"><span>事件时间：{{ new Date(event.eventAt).toLocaleString() }}</span><span>状态：{{ event.status }}</span></div>
-                <div class="tag-row"><span class="mini-tag" v-for="point in event.reminderPoints" :key="point.id">{{ point.label }}</span></div>
-                <div class="form-actions top-gap">
-                  <button class="secondary-btn" @click="beginEdit(event)">编辑</button>
-                  <button class="danger-btn" @click="removeEvent(event.id)">删除</button>
+            <div class="panel-head align-center"><div><p class="section-label">Timeline</p><h2>备忘录列表</h2></div><button class="secondary-btn" :disabled="dispatching" @click="runDispatch">{{ dispatching ? '扫描中...' : '立即扫描提醒' }}</button></div>
+            <div class="pill-switch list-switch">
+              <button :class="['pill-btn', listFocus === 'pending' && 'active']" @click="listFocus = 'pending'">待提醒</button>
+              <button :class="['pill-btn', listFocus === 'expired' && 'active']" @click="listFocus = 'expired'">已过期</button>
+            </div>
+            <div class="memo-lanes top-gap">
+              <section v-if="listFocus === 'pending'" :class="['subpanel', 'memo-lane', 'active-lane']">
+                <div class="lane-head">
+                  <h3>待提醒</h3>
+                  <span class="lane-count">{{ pendingEvents.length }}</span>
                 </div>
-              </article>
+                <div v-if="pendingEvents.length === 0" class="lane-empty">暂无待提醒备忘录。</div>
+                <div v-else class="list-stack">
+                  <article class="memo-card" v-for="event in pendingEvents" :key="event.id">
+                    <div class="memo-header"><div><h3>{{ event.title }}</h3><p>{{ event.content }}</p></div><span class="countdown-badge">{{ event.countdownLabel }}</span></div>
+                    <div class="meta-row"><span>事件时间：{{ new Date(event.eventAt).toLocaleString() }}</span><span>状态：{{ event.status }}</span></div>
+                    <div class="tag-row"><span class="mini-tag" v-for="point in event.reminderPoints" :key="point.id">{{ point.label }}</span></div>
+                    <div class="form-actions top-gap">
+                      <button class="secondary-btn" @click="beginEdit(event)">编辑</button>
+                      <button class="danger-btn" @click="removeEvent(event.id)">删除</button>
+                    </div>
+                  </article>
+                </div>
+              </section>
+              <section v-else :class="['subpanel', 'memo-lane', 'active-lane']">
+                <div class="lane-head">
+                  <h3>已过期</h3>
+                  <span class="lane-count">{{ expiredEvents.length }}</span>
+                </div>
+                <div v-if="expiredEvents.length === 0" class="lane-empty">暂无过期备忘录。</div>
+                <div v-else class="list-stack">
+                  <article class="memo-card" v-for="event in expiredEvents" :key="event.id">
+                    <div class="memo-header"><div><h3>{{ event.title }}</h3><p>{{ event.content }}</p></div><span class="countdown-badge">{{ event.countdownLabel }}</span></div>
+                    <div class="meta-row"><span>事件时间：{{ new Date(event.eventAt).toLocaleString() }}</span><span>状态：{{ event.status }}</span></div>
+                    <div class="tag-row"><span class="mini-tag" v-for="point in event.reminderPoints" :key="point.id">{{ point.label }}</span></div>
+                    <div class="form-actions top-gap">
+                      <button class="secondary-btn" @click="beginEdit(event)">编辑</button>
+                      <button class="danger-btn" @click="removeEvent(event.id)">删除</button>
+                    </div>
+                  </article>
+                </div>
+              </section>
             </div>
             <div class="dual-grid">
               <section class="subpanel"><div class="panel-head"><div><p class="section-label">Tasks</p><h3>提醒任务</h3></div></div><div class="log-list"><div class="log-item" v-for="task in tasks.slice(0, 8)" :key="task.id"><div><strong>{{ task.channelType }} · 任务 #{{ task.id }}</strong><p>计划：{{ new Date(task.scheduledAt).toLocaleString() }}</p></div><div class="log-side"><span :class="['log-status', task.status === 'sent' ? 'success' : task.status === 'failed' ? 'failed' : 'pending']">{{ task.status }}</span><small>{{ task.lastError || '等待调度或已成功投递' }}</small></div></div></div></section>
               <section class="subpanel"><div class="panel-head"><div><p class="section-label">Logs</p><h3>通知日志</h3></div></div><div class="log-list"><div class="log-item" v-for="log in logs.slice(0, 8)" :key="log.id"><div><strong>{{ log.channelName }}</strong><p>{{ log.message }}</p></div><div class="log-side"><span :class="['log-status', log.status]">{{ log.status }}</span><small>{{ new Date(log.triggeredAt).toLocaleString() }}</small></div></div></div></section>
             </div>
+          </section>
+
+          <section v-else-if="currentView === 'notify'" class="content-panel glass-panel">
+            <div class="panel-head align-center">
+              <div><p class="section-label">Notification</p><h2>通知相关</h2></div>
+              <button class="primary-btn" @click="createGroup">新建通知组</button>
+            </div>
+
+            <section v-if="!notifyEditorVisible" class="subpanel">
+              <div class="search-row">
+                <input v-model="groupQuery" class="search-input" placeholder="检索通知组名称、成员名或目标地址" />
+              </div>
+              <div class="group-card-grid">
+                <article class="memo-card" v-for="group in filteredNotifyGroups" :key="group.id">
+                  <div class="group-card-head">
+                    <div>
+                      <h3>{{ group.name }}</h3>
+                      <p>{{ group.enabled ? '已启用' : '未启用' }}</p>
+                    </div>
+                    <button class="secondary-btn" @click="editGroup(group)">进入配置</button>
+                  </div>
+                  <div class="tag-row"><span class="mini-tag" v-for="member in group.members" :key="member.id">{{ member.label }}（{{ member.type === 'email' ? '邮箱' : '钉钉' }}）</span></div>
+                </article>
+                <div v-if="filteredNotifyGroups.length === 0" class="lane-empty">没有匹配的通知组。</div>
+              </div>
+            </section>
+
+            <section v-else class="subpanel">
+              <div class="panel-head align-center">
+                <div><p class="section-label">Notify Group Editor</p><h3>{{ groupForm.id ? `编辑通知组 #${groupForm.id}` : '新建通知组' }}</h3></div>
+                <button class="secondary-btn" @click="closeGroupEditor">返回列表</button>
+              </div>
+              <p class="muted-copy" v-if="isGroupDirty">当前有未保存修改。</p>
+              <div class="form-grid">
+                <label class="field"><span>组名</span><input v-model="groupForm.name" placeholder="例如：工作提醒组" /></label>
+                <label class="field"><span>启用状态</span><select v-model="groupForm.enabled"><option :value="true">启用</option><option :value="false">停用</option></select></label>
+              </div>
+              <div class="subsection">
+                <span class="subsection-title">组成员</span>
+                <div class="form-grid" v-for="(member, idx) in groupForm.members" :key="idx">
+                  <label class="field"><span>类型</span><select v-model="member.type"><option value="email">邮箱</option><option value="dingtalk_webhook">钉钉 Webhook</option></select></label>
+                  <label class="field"><span>名称</span><input v-model="member.label" placeholder="例如：值班邮箱 / 项目群机器人" /></label>
+                  <label class="field field-full"><span>目标地址</span><input v-model="member.target" placeholder="邮箱地址 或 webhook 地址" /></label>
+                  <label class="field" v-if="member.type === 'dingtalk_webhook'"><span>Secret（可选）</span><input v-model="member.secret" type="password" /></label>
+                  <label class="field" v-if="member.type === 'dingtalk_webhook'"><span>关键词</span><input v-model="member.keyword" placeholder="例如：提醒" /></label>
+                  <label class="field" v-if="member.type === 'dingtalk_webhook'"><span>启用加签</span><select v-model="member.useSign"><option :value="false">否</option><option :value="true">是</option></select></label>
+                  <div class="field field-full">
+                    <div class="member-test-row">
+                    <button
+                      class="secondary-btn"
+                      :disabled="!member.target || testingMemberKey === `${member.type}-${idx}`"
+                      @click="testGroupMember(member, idx)"
+                    >
+                      {{ testingMemberKey === `${member.type}-${idx}` ? '发送中...' : `发送${member.type === 'email' ? '邮箱' : '钉钉'}测试消息` }}
+                    </button>
+                    <span
+                      v-if="memberTestStatus[`${member.type}-${idx}`] && memberTestStatus[`${member.type}-${idx}`].state !== 'idle'"
+                      :class="[
+                        'member-test-status',
+                        memberTestStatus[`${member.type}-${idx}`].state === 'success' && 'success',
+                        memberTestStatus[`${member.type}-${idx}`].state === 'error' && 'error',
+                        memberTestStatus[`${member.type}-${idx}`].state === 'sending' && 'sending'
+                      ]"
+                    >
+                      {{ memberTestStatus[`${member.type}-${idx}`].message }}
+                    </span>
+                    </div>
+                  </div>
+                </div>
+                <div class="form-actions"><button class="secondary-btn" @click="addGroupMember">新增成员</button></div>
+              </div>
+              <div class="form-actions">
+                <button class="primary-btn" :disabled="savingGroup" @click="submitNotifyGroup">{{ savingGroup ? '保存中...' : (groupForm.id ? '更新通知组' : '创建通知组') }}</button>
+                <button class="secondary-btn" @click="closeGroupEditor">退出</button>
+                <button v-if="groupForm.id" class="danger-btn" @click="removeGroup(groupForm.id)">删除通知组</button>
+              </div>
+            </section>
           </section>
 
           <section v-else class="content-panel glass-panel">
@@ -813,21 +1158,6 @@ onMounted(async () => {
                     <span>测试邮箱：{{ reminderDraft.testMailTo || '未填写' }}</span>
                   </div>
                 </article>
-
-                <article class="channel-status-card">
-                  <div class="channel-status-head">
-                    <div>
-                      <p class="section-label">DingTalk Channel</p>
-                      <h3>钉钉提醒</h3>
-                    </div>
-                    <span :class="['status-chip', dingTalkReady ? 'ready' : 'missing']">{{ dingTalkReady ? '已就绪' : '未配置完成' }}</span>
-                  </div>
-                  <p>{{ dingTalkReady ? 'Webhook 已配置，可参与提醒任务派发。' : '请补充 Webhook，若启用了加签还需填写 Secret。' }}</p>
-                  <div class="channel-meta-row">
-                    <span>启用状态：{{ dingTalkForm.enabled ? '已启用' : '未启用' }}</span>
-                    <span>加签：{{ dingTalkForm.useSign ? '已开启' : '未开启' }}</span>
-                  </div>
-                </article>
               </section>
 
               <section class="subpanel">
@@ -839,38 +1169,6 @@ onMounted(async () => {
                   <label class="field"><span>个人简介</span><input v-model="uiSettings.displaySubTitle" /></label>
                 </div>
                 <div class="form-actions"><button class="primary-btn" :disabled="savingUi" @click="saveUiSettings">{{ savingUi ? '保存中...' : '保存界面设置' }}</button></div>
-              </section>
-              <section class="subpanel">
-                <div class="panel-head"><div><p class="section-label">Notify Groups</p><h3>通知组管理</h3></div></div>
-                <div class="form-grid">
-                  <label class="field"><span>组名</span><input v-model="groupForm.name" placeholder="例如：工作提醒组" /></label>
-                  <label class="field"><span>启用状态</span><select v-model="groupForm.enabled"><option :value="true">启用</option><option :value="false">停用</option></select></label>
-                </div>
-                <div class="subsection">
-                  <span class="subsection-title">组成员</span>
-                  <div class="form-grid" v-for="(member, idx) in groupForm.members" :key="idx">
-                    <label class="field"><span>类型</span><select v-model="member.type"><option value="email">邮箱</option><option value="dingtalk_webhook">钉钉 Webhook</option></select></label>
-                    <label class="field"><span>名称</span><input v-model="member.label" placeholder="例如：值班邮箱 / 项目群机器人" /></label>
-                    <label class="field field-full"><span>目标地址</span><input v-model="member.target" placeholder="邮箱地址 或 webhook 地址" /></label>
-                    <label class="field" v-if="member.type === 'dingtalk_webhook'"><span>Secret（可选）</span><input v-model="member.secret" type="password" /></label>
-                    <label class="field" v-if="member.type === 'dingtalk_webhook'"><span>启用加签</span><select v-model="member.useSign"><option :value="false">否</option><option :value="true">是</option></select></label>
-                  </div>
-                  <div class="form-actions"><button class="secondary-btn" @click="addGroupMember">新增成员</button></div>
-                </div>
-                <div class="form-actions">
-                  <button class="primary-btn" :disabled="savingGroup" @click="submitNotifyGroup">{{ savingGroup ? '保存中...' : (groupForm.id ? '更新通知组' : '创建通知组') }}</button>
-                  <button class="secondary-btn" @click="resetGroupForm">重置</button>
-                </div>
-                <div class="list-stack top-gap">
-                  <article class="memo-card" v-for="group in notifyGroups" :key="group.id">
-                    <div class="memo-header"><div><h3>{{ group.name }}</h3><p>{{ group.enabled ? '已启用' : '未启用' }}</p></div></div>
-                    <div class="tag-row"><span class="mini-tag" v-for="member in group.members" :key="member.id">{{ member.label }}（{{ member.type === 'email' ? '邮箱' : '钉钉' }}）</span></div>
-                    <div class="form-actions top-gap">
-                      <button class="secondary-btn" @click="editGroup(group)">编辑</button>
-                      <button class="danger-btn" @click="removeGroup(group.id)">删除</button>
-                    </div>
-                  </article>
-                </div>
               </section>
               <section class="subpanel">
                 <div class="panel-head"><div><p class="section-label">SMTP</p><h3>邮件发送配置</h3></div></div>
@@ -912,23 +1210,21 @@ onMounted(async () => {
                 </div>
                 </div>
               </section>
-              <section class="subpanel">
-                <div class="panel-head"><div><p class="section-label">DingTalk</p><h3>钉钉机器人配置</h3></div></div>
-                <button class="collapse-btn" @click="showDingTalkConfig = !showDingTalkConfig">{{ showDingTalkConfig ? '收起' : '展开' }}</button>
-                <div v-if="showDingTalkConfig">
-                <div class="pill-switch"><button :class="['pill-btn', dingTalkForm.enabled && 'active']" @click="dingTalkForm.enabled = true">启用</button><button :class="['pill-btn', !dingTalkForm.enabled && 'active']" @click="dingTalkForm.enabled = false">停用</button></div>
-                <div class="form-grid">
-                  <label class="field field-full"><span>Webhook</span><input v-model="dingTalkForm.webhook" /></label>
-                  <label class="field"><span>关键词</span><input v-model="dingTalkForm.keyword" /></label>
-                  <label class="field"><span>Secret</span><input v-model="dingTalkForm.secret" type="password" /></label>
-                </div>
-                <div class="toggle-row"><label class="checkbox-line"><input v-model="dingTalkForm.useSign" type="checkbox" /><span>启用加签参数</span></label></div>
-                <div class="form-actions"><button class="primary-btn" :disabled="savingDingTalk" @click="submitDingTalkConfig">{{ savingDingTalk ? '保存中...' : '保存钉钉配置' }}</button></div>
-                </div>
-              </section>
             </div>
           </section>
         </main>
+      </section>
+    </div>
+
+    <div v-if="confirmState.visible" class="confirm-mask" @click="closeConfirm(false)">
+      <section class="confirm-dialog glass-panel" @click.stop>
+        <p class="section-label">Confirm</p>
+        <h3>{{ confirmState.title }}</h3>
+        <p class="muted-copy">{{ confirmState.message }}</p>
+        <div class="form-actions top-gap">
+          <button class="secondary-btn" @click="closeConfirm(false)">{{ confirmState.cancelText }}</button>
+          <button class="primary-btn" @click="closeConfirm(true)">{{ confirmState.confirmText }}</button>
+        </div>
       </section>
     </div>
   </div>

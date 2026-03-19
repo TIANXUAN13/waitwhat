@@ -16,7 +16,7 @@ on:
         default: 'false'
 
 env:
-  IMAGE_NAME: waitwhat-backend
+  IMAGE_NAME: waitwhat
 
 jobs:
   build-and-push:

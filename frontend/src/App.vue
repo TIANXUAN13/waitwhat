@@ -1964,6 +1964,7 @@ watch(
                   <label class="checkbox-line"><input v-model="mailForm.useTls" type="checkbox" /><span>使用 TLS</span></label>
                   <label class="checkbox-line"><input v-model="mailForm.useSsl" type="checkbox" /><span>使用 SSL</span></label>
                 </div>
+                <p class="field-hint">建议：端口 465 使用 SSL；端口 587 使用 TLS（STARTTLS）。</p>
                 <div class="form-actions">
                   <button class="primary-btn" :disabled="savingMail" @click="submitMailConfig">{{ savingMail ? '保存中...' : '保存 SMTP 配置' }}</button>
                   <button class="secondary-btn" :disabled="testingMail" @click="testMailConfig">{{ testingMail ? '发送中...' : '发送测试邮件' }}</button>

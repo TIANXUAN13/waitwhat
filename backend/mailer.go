@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"net"
 	"net/smtp"
@@ -25,20 +26,22 @@ func (m *SMTPMailer) Send(to, subject, body string) error {
 	if !m.cfg.Enabled {
 		return fmt.Errorf("邮件发送未启用")
 	}
-	if m.cfg.Host == "" || m.cfg.Username == "" || m.cfg.Password == "" || m.cfg.FromAddress == "" {
+	if m.cfg.Host == "" || m.cfg.FromAddress == "" {
 		return fmt.Errorf("SMTP 配置不完整")
 	}
 
 	address := net.JoinHostPort(m.cfg.Host, fmt.Sprintf("%d", m.cfg.Port))
-	auth := smtp.PlainAuth("", m.cfg.Username, m.cfg.Password, m.cfg.Host)
+	auth, err := m.buildAuth()
+	if err != nil {
+		return err
+	}
 	msg := buildMessage(m.cfg.FromName, m.cfg.FromAddress, to, subject, body)
 
 	writeMailLog("mail send start host=%s port=%d to=%s from=%s tls=%t ssl=%t", m.cfg.Host, m.cfg.Port, to, m.cfg.FromAddress, m.cfg.UseTLS, m.cfg.UseSSL)
 
-	var err error
 	var primaryErr error
 	switch {
-	case m.cfg.UseSSL:
+	case m.cfg.UseSSL || m.cfg.Port == 465:
 		err = m.sendWithImplicitTLS(address, auth, to, msg)
 	default:
 		if m.cfg.UseTLS {
@@ -82,9 +85,11 @@ func (m *SMTPMailer) sendWithImplicitTLS(address string, auth smtp.Auth, to, msg
 	}
 	defer client.Quit()
 
-	if err := client.Auth(auth); err != nil {
-		writeMailLog("mail implicit tls auth failed host=%s port=%d username=%s err=%v", m.cfg.Host, m.cfg.Port, m.cfg.Username, err)
-		return err
+	if auth != nil {
+		if err := client.Auth(auth); err != nil {
+			writeMailLog("mail implicit tls auth failed host=%s port=%d username=%s err=%v", m.cfg.Host, m.cfg.Port, m.cfg.Username, err)
+			return err
+		}
 	}
 	if err := client.Mail(m.cfg.FromAddress); err != nil {
 		writeMailLog("mail implicit tls mail from failed from=%s err=%v", m.cfg.FromAddress, err)
@@ -110,6 +115,21 @@ func (m *SMTPMailer) sendWithImplicitTLS(address string, auth smtp.Auth, to, msg
 		return err
 	}
 	return nil
+}
+
+func (m *SMTPMailer) buildAuth() (smtp.Auth, error) {
+	username := strings.TrimSpace(m.cfg.Username)
+	password := strings.TrimSpace(m.cfg.Password)
+	if password == "" {
+		return nil, nil
+	}
+	if username == "" {
+		username = strings.TrimSpace(m.cfg.FromAddress)
+	}
+	if username == "" {
+		return nil, errors.New("已填写授权码时，账号或发件人邮箱至少填写一个")
+	}
+	return smtp.PlainAuth("", username, password, m.cfg.Host), nil
 }
 
 func buildMessage(fromName, fromAddress, to, subject, body string) string {

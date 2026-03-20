@@ -80,7 +80,7 @@ npm run dev
 
 触发方式：
 
-- 推送 tag（例如 `v1.0.0`）自动发布
+- 推送 tag（例如 `V1234`）自动发布
 - 手动触发工作流也可发布
 
 ## Docker 镜像运行（单容器前后端）
@@ -88,13 +88,46 @@ npm run dev
 发布出的镜像已内置前端静态页面与后端 API，启动一个容器即可：
 
 ```bash
-docker run -d --name waitwhat -p 8080:8080 -v "$(pwd)/data:/app/data" 2926930231/waitwhat:latest
+mkdir -p ./data
+sudo chown -R 1000:1000 ./data
+docker run -d \
+  --name waitwhat \
+  --user 1000:1000 \
+  -p 8080:8080 \
+  -e APP_PORT=8080 \
+  -e APP_DATA_DIR=/app/data \
+  -e APP_WEB_DIR=/app/web \
+  -v "$(pwd)/data:/app/data" \
+  2926930231/waitwhat:latest
 ```
 
 访问：
 
 - 应用主页：`http://127.0.0.1:8080`
 - 健康检查：`http://127.0.0.1:8080/api/health`
+
+## Docker Compose 启动
+
+项目已提供 `docker-compose.yaml`，默认同样以 `1000:1000` 用户组运行：
+
+```bash
+mkdir -p ./data
+sudo chown -R 1000:1000 ./data
+docker compose up -d
+```
+
+停止：
+
+```bash
+docker compose down
+```
+
+如果你的服务器启用了 SELinux，请把挂载改成带标签：
+
+```yaml
+volumes:
+  - ./data:/app/data:Z
+```
 
 ## 说明
 

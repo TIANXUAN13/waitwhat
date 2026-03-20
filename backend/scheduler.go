@@ -684,7 +684,9 @@ func computeNotifyAt(event MemoEvent, point ReminderPoint, now time.Time) (time.
 func isExpiredOneTimeEvent(event MemoEvent, now time.Time) bool {
 	recurrence := strings.ToLower(strings.TrimSpace(event.RecurrenceType))
 	if recurrence == "" || recurrence == "once" {
-		return event.EventAt.Before(now)
+		// Allow short scheduling delay (cron tick / queue latency) so "到点提醒" is not dropped.
+		const grace = 10 * time.Minute
+		return event.EventAt.Add(grace).Before(now)
 	}
 	return false
 }

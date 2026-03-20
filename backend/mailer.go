@@ -4,6 +4,8 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"html"
+	"mime"
 	"net"
 	"net/smtp"
 	"strings"
@@ -137,16 +139,62 @@ func buildMessage(fromName, fromAddress, to, subject, body string) string {
 	if strings.TrimSpace(fromName) != "" {
 		from = fmt.Sprintf("%s <%s>", fromName, fromAddress)
 	}
+	encodedSubject := mime.QEncoding.Encode("UTF-8", subject)
+	boundary := fmt.Sprintf("waitwhat-%d", time.Now().UnixNano())
+	plainBody := body
+	htmlBody := buildHTMLMailBody(subject, body)
 	lines := []string{
 		"From: " + from,
 		"To: " + to,
-		"Subject: " + subject,
+		"Subject: " + encodedSubject,
 		"MIME-Version: 1.0",
-		"Content-Type: text/plain; charset=UTF-8",
+		fmt.Sprintf("Content-Type: multipart/alternative; boundary=%q", boundary),
 		"",
-		body,
+		"--" + boundary,
+		"Content-Type: text/plain; charset=UTF-8",
+		"Content-Transfer-Encoding: 8bit",
+		"",
+		plainBody,
+		"",
+		"--" + boundary,
+		"Content-Type: text/html; charset=UTF-8",
+		"Content-Transfer-Encoding: 8bit",
+		"",
+		htmlBody,
+		"",
+		"--" + boundary + "--",
 	}
 	return strings.Join(lines, "\r\n")
+}
+
+func buildHTMLMailBody(subject, body string) string {
+	safeSubject := html.EscapeString(subject)
+	safeBody := html.EscapeString(body)
+	safeBody = strings.ReplaceAll(safeBody, "\n", "<br>")
+	return fmt.Sprintf(`<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>%s</title>
+</head>
+<body style="margin:0;padding:0;background:#f3f8f7;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'PingFang SC','Hiragino Sans GB','Microsoft YaHei',sans-serif;color:#173c39;">
+  <div style="max-width:620px;margin:24px auto;padding:0 12px;">
+    <div style="background:#ffffff;border:1px solid #d9ece8;border-radius:16px;overflow:hidden;box-shadow:0 6px 18px rgba(23,60,57,0.08);">
+      <div style="padding:18px 20px;background:linear-gradient(135deg,#1fa58b 0%%,#1b7d6f 100%%);color:#fff;">
+        <div style="font-size:12px;letter-spacing:1.5px;opacity:.9;">WAITWHAT MAIL</div>
+        <div style="font-size:20px;font-weight:700;margin-top:6px;">%s</div>
+      </div>
+      <div style="padding:20px;line-height:1.75;font-size:15px;color:#1f3f3b;">
+        %s
+      </div>
+      <div style="padding:12px 20px;border-top:1px solid #e9f3f1;font-size:12px;color:#5f7f7a;background:#fbfefe;">
+        此邮件由 WaitWhat 自动发送，请勿直接回复。
+      </div>
+    </div>
+  </div>
+</body>
+</html>`, safeSubject, safeSubject, safeBody)
 }
 
 func shouldFallbackToImplicitTLS(cfg MailConfig, err error) bool {

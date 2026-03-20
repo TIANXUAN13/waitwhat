@@ -45,6 +45,7 @@ type AuthMode = 'login' | 'register'
 const SETTINGS_KEY = 'waitwhat-ui-settings'
 const LOGIN_READY_HINT_SEEN_KEY = 'waitwhat-login-ready-hint-seen'
 const COMPOSER_DRAFT_KEY = 'waitwhat-composer-draft'
+const MAIL_CONFIG_COLLAPSE_KEY = 'waitwhat-mail-config-collapsed'
 
 const loading = ref(true)
 const submitting = ref(false)
@@ -393,12 +394,24 @@ function addCustomReminderOption() {
 
 function loadUiSettings() {
   const raw = localStorage.getItem(SETTINGS_KEY)
-  if (!raw) return
-  try {
-    Object.assign(uiSettings, JSON.parse(raw))
-  } catch {
-    return
+  if (raw) {
+    try {
+      Object.assign(uiSettings, JSON.parse(raw))
+    } catch {
+      // ignore bad local cache
+    }
   }
+  const collapsed = localStorage.getItem(MAIL_CONFIG_COLLAPSE_KEY)
+  if (collapsed === '1') {
+    showMailConfig.value = false
+  } else if (collapsed === '0') {
+    showMailConfig.value = true
+  }
+}
+
+function toggleMailConfig() {
+  showMailConfig.value = !showMailConfig.value
+  localStorage.setItem(MAIL_CONFIG_COLLAPSE_KEY, showMailConfig.value ? '0' : '1')
 }
 
 function saveComposerDraft() {
@@ -2008,7 +2021,7 @@ watch(
 
               <section class="subpanel">
                 <div class="panel-head"><div><p class="section-label">SMTP</p><h3>邮件发送配置</h3></div></div>
-                <button class="collapse-btn" @click="showMailConfig = !showMailConfig">{{ showMailConfig ? '收起' : '展开' }}</button>
+                <button class="collapse-btn" @click="toggleMailConfig">{{ showMailConfig ? '收起' : '展开' }}</button>
                 <div v-if="showMailConfig">
                 <div class="pill-switch"><button :class="['pill-btn', mailForm.enabled && 'active']" @click="mailForm.enabled = true">启用</button><button :class="['pill-btn', !mailForm.enabled && 'active']" @click="mailForm.enabled = false">停用</button></div>
                 <div class="form-grid">

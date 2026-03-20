@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -74,9 +75,21 @@ func (r *Repository) SendTestMail(ctx context.Context, userID int64, to string) 
 		"这是一封测试邮件。",
 		"",
 		"如果你收到了这封邮件，说明当前 SMTP 配置可以正常发送。",
-		"发送时间: " + time.Now().Format("2006-01-02 15:04:05"),
+		"发送时间: " + formatTestMailTime(),
 	}, "\n")
 	return mailer.Send(to, subject, body)
+}
+
+func formatTestMailTime() string {
+	timezone := strings.TrimSpace(os.Getenv("APP_TIMEZONE"))
+	if timezone == "" {
+		timezone = "Asia/Shanghai"
+	}
+	loc, err := time.LoadLocation(timezone)
+	if err != nil {
+		loc = time.Local
+	}
+	return time.Now().In(loc).Format("2006-01-02 15:04:05 -07:00 MST")
 }
 
 func (r *Repository) SaveDingTalkConfig(ctx context.Context, userID int64, req SaveDingTalkConfigRequest) (DingTalkConfig, error) {

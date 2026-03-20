@@ -988,7 +988,7 @@ async function submitMailConfig() {
     mailPasswordSaved.value = true
     mailForm.password = ''
     successMessage.value = 'SMTP 配置已保存。'
-    await loadData()
+    await loadData({ silent: true })
   } catch (error) {
     errorMessage.value = normalizeErrorMessage(error, 'SMTP 配置保存失败')
   } finally {

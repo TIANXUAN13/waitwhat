@@ -12,6 +12,8 @@ import (
 	"time"
 )
 
+const maxReminderRetries = 3
+
 func (r *Repository) SaveMailConfig(ctx context.Context, userID int64, req SaveMailConfigRequest) (MailConfig, error) {
 	db, err := r.openDB()
 	if err != nil {
@@ -310,10 +312,11 @@ func (r *Repository) runPendingTasks(ctx context.Context, db *sql.DB) (ReminderD
 		}
 
 		if sendErr != nil {
-			if task.RetryCount < task.MaxRetries {
+			effectiveMax := effectiveMaxRetries(task.MaxRetries)
+			if task.RetryCount < effectiveMax {
 				nextAt := time.Now().Add(nextRetryDelay(task.RetryCount + 1))
 				logEntry.Status = "retrying"
-				logEntry.Message = fmt.Sprintf("发送失败，将重试(%d/%d)：%v", task.RetryCount+1, task.MaxRetries, sendErr)
+				logEntry.Message = fmt.Sprintf("发送失败，将重试(%d/%d)：%v", task.RetryCount+1, effectiveMax, sendErr)
 				result.Retried++
 				if err := markTaskRetry(ctx, db, r.cfg.Database.SelectedDriver, task.ID, task.RetryCount+1, nextAt, sendErr.Error()); err != nil {
 					return result, err
@@ -500,14 +503,14 @@ func loadUserDingTalkConfig(ctx context.Context, db *sql.DB, driver DatabaseDriv
 }
 
 func loadPendingTasks(ctx context.Context, db *sql.DB) ([]ReminderTask, error) {
-	now := time.Now().Format(time.RFC3339)
-	rows, err := db.QueryContext(ctx, "SELECT id, event_id, reminder_id, channel_id, channel_type, status, scheduled_at, triggered_at, last_error, retry_count, max_retries FROM reminder_tasks WHERE status = 'pending' AND scheduled_at <= ? ORDER BY scheduled_at ASC, id ASC", now)
+	rows, err := db.QueryContext(ctx, "SELECT id, event_id, reminder_id, channel_id, channel_type, status, scheduled_at, triggered_at, last_error, retry_count, max_retries FROM reminder_tasks WHERE status = 'pending' ORDER BY scheduled_at ASC, id ASC")
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
 	var tasks []ReminderTask
+	now := time.Now()
 	for rows.Next() {
 		var task ReminderTask
 		var scheduledAt, triggeredAt string
@@ -517,6 +520,9 @@ func loadPendingTasks(ctx context.Context, db *sql.DB) ([]ReminderTask, error) {
 		task.ScheduledAt, _ = time.Parse(time.RFC3339, scheduledAt)
 		if triggeredAt != "" {
 			task.TriggeredAt, _ = time.Parse(time.RFC3339, triggeredAt)
+		}
+		if task.ScheduledAt.After(now) {
+			continue
 		}
 		tasks = append(tasks, task)
 	}
@@ -537,10 +543,10 @@ func ensureReminderTask(ctx context.Context, db *sql.DB, driver DatabaseDriver, 
 		}
 		_, insertErr := execWithDriver(ctx, db, driver,
 			`INSERT INTO reminder_tasks (event_id, reminder_id, channel_id, channel_type, status, scheduled_at, triggered_at, last_error, retry_count, max_retries)
-			 VALUES (?, ?, ?, ?, 'pending', ?, '', '', 0, 5)`,
+			 VALUES (?, ?, ?, ?, 'pending', ?, '', '', 0, ?)`,
 			`INSERT INTO reminder_tasks (event_id, reminder_id, channel_id, channel_type, status, scheduled_at, triggered_at, last_error, retry_count, max_retries)
-			 VALUES ($1, $2, $3, $4, 'pending', $5, '', '', 0, 5)`,
-			eventID, reminderID, channelID, channelType, scheduledAt.Format(time.RFC3339),
+			 VALUES ($1, $2, $3, $4, 'pending', $5, '', '', 0, $6)`,
+			eventID, reminderID, channelID, channelType, scheduledAt.Format(time.RFC3339), maxReminderRetries,
 		)
 		return insertErr
 	}
@@ -549,9 +555,9 @@ func ensureReminderTask(ctx context.Context, db *sql.DB, driver DatabaseDriver, 
 		return nil
 	}
 	_, updateErr := execWithDriver(ctx, db, driver,
-		`UPDATE reminder_tasks SET status = 'pending', scheduled_at = ?, triggered_at = '', last_error = '', retry_count = 0, max_retries = 5 WHERE id = ?`,
-		`UPDATE reminder_tasks SET status = 'pending', scheduled_at = $1, triggered_at = '', last_error = '', retry_count = 0, max_retries = 5 WHERE id = $2`,
-		scheduledAt.Format(time.RFC3339), taskID,
+		`UPDATE reminder_tasks SET status = 'pending', scheduled_at = ?, triggered_at = '', last_error = '', retry_count = 0, max_retries = ? WHERE id = ?`,
+		`UPDATE reminder_tasks SET status = 'pending', scheduled_at = $1, triggered_at = '', last_error = '', retry_count = 0, max_retries = $2 WHERE id = $3`,
+		scheduledAt.Format(time.RFC3339), maxReminderRetries, taskID,
 	)
 	return updateErr
 }
@@ -614,6 +620,13 @@ func nextRetryDelay(retryCount int) time.Duration {
 		seconds = 1800
 	}
 	return time.Duration(seconds) * time.Second
+}
+
+func effectiveMaxRetries(value int) int {
+	if value <= 0 || value > maxReminderRetries {
+		return maxReminderRetries
+	}
+	return value
 }
 
 func containsInt64(list []int64, target int64) bool {

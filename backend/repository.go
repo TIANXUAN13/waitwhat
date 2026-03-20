@@ -1322,11 +1322,11 @@ var sqliteSchema = []string{
 		triggered_at TEXT NOT NULL DEFAULT '',
 		last_error TEXT NOT NULL DEFAULT '',
 		retry_count INTEGER NOT NULL DEFAULT 0,
-		max_retries INTEGER NOT NULL DEFAULT 5,
+		max_retries INTEGER NOT NULL DEFAULT 3,
 		UNIQUE(event_id, reminder_id, channel_id)
 	)`,
 	`ALTER TABLE reminder_tasks ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0`,
-	`ALTER TABLE reminder_tasks ADD COLUMN max_retries INTEGER NOT NULL DEFAULT 5`,
+	`ALTER TABLE reminder_tasks ADD COLUMN max_retries INTEGER NOT NULL DEFAULT 3`,
 	`CREATE TABLE IF NOT EXISTS user_mail_settings (
 		user_id INTEGER PRIMARY KEY,
 		enabled INTEGER NOT NULL DEFAULT 0,
@@ -1450,11 +1450,11 @@ var postgresSchema = []string{
 		triggered_at TEXT NOT NULL DEFAULT '',
 		last_error TEXT NOT NULL DEFAULT '',
 		retry_count INTEGER NOT NULL DEFAULT 0,
-		max_retries INTEGER NOT NULL DEFAULT 5,
+		max_retries INTEGER NOT NULL DEFAULT 3,
 		UNIQUE(event_id, reminder_id, channel_id)
 	)`,
 	`ALTER TABLE reminder_tasks ADD COLUMN IF NOT EXISTS retry_count INTEGER NOT NULL DEFAULT 0`,
-	`ALTER TABLE reminder_tasks ADD COLUMN IF NOT EXISTS max_retries INTEGER NOT NULL DEFAULT 5`,
+	`ALTER TABLE reminder_tasks ADD COLUMN IF NOT EXISTS max_retries INTEGER NOT NULL DEFAULT 3`,
 	`CREATE TABLE IF NOT EXISTS user_mail_settings (
 		user_id BIGINT PRIMARY KEY,
 		enabled INTEGER NOT NULL DEFAULT 0,

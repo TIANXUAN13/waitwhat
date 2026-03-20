@@ -219,17 +219,32 @@ function normalizedRecurrence(type?: string) {
   return (type || 'once').trim().toLowerCase()
 }
 
-function isOnceEventExpired(eventAt: string) {
-  const ts = new Date(eventAt).getTime()
-  if (!Number.isFinite(ts)) return false
-  return ts+ONCE_EVENT_EXPIRE_GRACE_MS < Date.now()
+function parseEventTimeMs(raw: string) {
+  let ts = new Date(raw).getTime()
+  if (Number.isFinite(ts)) return ts
+  const normalized = raw.replace(/\//g, '-').replace(' ', 'T')
+  ts = new Date(normalized).getTime()
+  if (Number.isFinite(ts)) return ts
+  if (!/[zZ]|[+-]\d{2}:\d{2}$/.test(normalized)) {
+    ts = new Date(`${normalized}+08:00`).getTime()
+    if (Number.isFinite(ts)) return ts
+  }
+  return Number.NaN
+}
+
+function isOnceEventExpired(event: AppState['events'][number]) {
+  const ts = parseEventTimeMs(event.eventAt)
+  if (Number.isFinite(ts)) {
+    return ts + ONCE_EVENT_EXPIRE_GRACE_MS < Date.now()
+  }
+  return event.countdownLabel === '已过期'
 }
 
 const pendingEvents = computed(() =>
-  events.value.filter((event) => normalizedRecurrence(event.recurrenceType) !== 'once' || !isOnceEventExpired(event.eventAt))
+  events.value.filter((event) => normalizedRecurrence(event.recurrenceType) !== 'once' || !isOnceEventExpired(event))
 )
 const expiredEvents = computed(() =>
-  events.value.filter((event) => normalizedRecurrence(event.recurrenceType) === 'once' && isOnceEventExpired(event.eventAt))
+  events.value.filter((event) => normalizedRecurrence(event.recurrenceType) === 'once' && isOnceEventExpired(event))
 )
 const filteredPendingEvents = computed(() => {
   const keyword = listQuery.value.trim().toLowerCase()

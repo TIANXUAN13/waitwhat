@@ -69,21 +69,9 @@ npm run dev
 
 如果直接在 `./dev.sh` 运行界面中按 `Ctrl+C`，也会自动清理前后端进程。
 
-## Docker 镜像发布（GitHub Actions）
 
-项目已支持通过 GitHub Actions 自动构建并推送后端镜像到 Docker Hub。
 
-需要在仓库 Secrets 配置：
-
-- `DOCKERHUB_USERNAME`
-- `DOCKERHUB_TOKEN`
-
-触发方式：
-
-- 推送 tag（例如 `V1234`）自动发布
-- 手动触发工作流也可发布
-
-## Docker 镜像运行（单容器前后端）
+## Docker 镜像运行
 
 发布出的镜像已内置前端静态页面与后端 API，启动一个容器即可：
 
@@ -109,6 +97,26 @@ docker run -d \
 ## Docker Compose 启动
 
 项目已提供 `docker-compose.yaml`，默认同样以 `1000:1000` 用户组运行：
+
+```
+services:
+  waitwhat:
+    image: 2926930231/waitwhat:latest
+    container_name: waitwhat
+    restart: unless-stopped
+    user: "1000:1000"
+    ports:
+      - "8080:8080"
+    environment:
+      APP_PORT: "8080"
+      APP_DATA_DIR: /app/data
+      APP_WEB_DIR: /app/web
+      APP_CORS_ALLOW_ORIGIN: "*"
+    volumes:
+      - ./data:/app/data
+```
+
+
 
 ```bash
 mkdir -p ./data

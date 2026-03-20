@@ -213,15 +213,23 @@ const notifyGroups = computed<NotificationGroup[]>(() => appState.value?.notifyG
 const events = computed(() => appState.value?.events ?? [])
 const tasks = computed(() => appState.value?.tasks ?? [])
 const logs = computed(() => appState.value?.logs ?? [])
+
+const ONCE_EVENT_EXPIRE_GRACE_MS = 10 * 60 * 1000
 function normalizedRecurrence(type?: string) {
   return (type || 'once').trim().toLowerCase()
 }
 
+function isOnceEventExpired(eventAt: string) {
+  const ts = new Date(eventAt).getTime()
+  if (!Number.isFinite(ts)) return false
+  return ts+ONCE_EVENT_EXPIRE_GRACE_MS < Date.now()
+}
+
 const pendingEvents = computed(() =>
-  events.value.filter((event) => normalizedRecurrence(event.recurrenceType) !== 'once' || new Date(event.eventAt).getTime() >= Date.now())
+  events.value.filter((event) => normalizedRecurrence(event.recurrenceType) !== 'once' || !isOnceEventExpired(event.eventAt))
 )
 const expiredEvents = computed(() =>
-  events.value.filter((event) => normalizedRecurrence(event.recurrenceType) === 'once' && new Date(event.eventAt).getTime() < Date.now())
+  events.value.filter((event) => normalizedRecurrence(event.recurrenceType) === 'once' && isOnceEventExpired(event.eventAt))
 )
 const filteredPendingEvents = computed(() => {
   const keyword = listQuery.value.trim().toLowerCase()

@@ -561,13 +561,14 @@ func loadPendingTasks(ctx context.Context, db *sql.DB) ([]ReminderTask, error) {
 }
 
 func ensureReminderTask(ctx context.Context, db *sql.DB, driver DatabaseDriver, eventID, reminderID, channelID int64, channelType string, scheduledAt time.Time) error {
-	query := `SELECT id, scheduled_at FROM reminder_tasks WHERE event_id = ? AND reminder_id = ? AND channel_id = ?`
+	query := `SELECT id, status, scheduled_at FROM reminder_tasks WHERE event_id = ? AND reminder_id = ? AND channel_id = ?`
 	if driver == DriverPG {
-		query = `SELECT id, scheduled_at FROM reminder_tasks WHERE event_id = $1 AND reminder_id = $2 AND channel_id = $3`
+		query = `SELECT id, status, scheduled_at FROM reminder_tasks WHERE event_id = $1 AND reminder_id = $2 AND channel_id = $3`
 	}
 	var taskID int64
+	var status string
 	var existingScheduled string
-	err := db.QueryRowContext(ctx, query, eventID, reminderID, channelID).Scan(&taskID, &existingScheduled)
+	err := db.QueryRowContext(ctx, query, eventID, reminderID, channelID).Scan(&taskID, &status, &existingScheduled)
 	if err != nil {
 		if !errors.Is(err, sql.ErrNoRows) {
 			return err
@@ -576,15 +577,24 @@ func ensureReminderTask(ctx context.Context, db *sql.DB, driver DatabaseDriver, 
 			`INSERT INTO reminder_tasks (event_id, reminder_id, channel_id, channel_type, status, scheduled_at, triggered_at, last_error, retry_count, max_retries)
 			 VALUES (?, ?, ?, ?, 'pending', ?, '', '', 0, ?)`,
 			`INSERT INTO reminder_tasks (event_id, reminder_id, channel_id, channel_type, status, scheduled_at, triggered_at, last_error, retry_count, max_retries)
-			 VALUES ($1, $2, $3, $4, 'pending', $5, '', '', 0, $6)`,
+			 VALUES ($1, $2, $3, $4, $5, $6, '', '', 0, $7)`,
 			eventID, reminderID, channelID, channelType, scheduledAt.Format(time.RFC3339), maxReminderRetries,
 		)
 		return insertErr
 	}
+
 	existingAt, _ := time.Parse(time.RFC3339, existingScheduled)
+	// If the time is the same, don't touch it if it's already done or in progress
 	if !scheduledAt.After(existingAt) {
+		if status == "sent" || status == "processing" || status == "skipped" {
+			return nil
+		}
+		// If it was failed or pending, we might want to ensure it's still pending?
+		// But for now, if time is same, we trust the existing status.
 		return nil
 	}
+
+	// New scheduled time, so reset to pending
 	_, updateErr := execWithDriver(ctx, db, driver,
 		`UPDATE reminder_tasks SET status = 'pending', scheduled_at = ?, triggered_at = '', last_error = '', retry_count = 0, max_retries = ? WHERE id = ?`,
 		`UPDATE reminder_tasks SET status = 'pending', scheduled_at = $1, triggered_at = '', last_error = '', retry_count = 0, max_retries = $2 WHERE id = $3`,

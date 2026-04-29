@@ -21,3 +21,6 @@ backend/tmp
 *.sqlite3
 /backend/data/
 /data/
+debug_data/
+backend/waitwhat_debug.exe
+gemini

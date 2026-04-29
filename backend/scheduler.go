@@ -143,10 +143,6 @@ func (r *Repository) SendTestDingTalkWebhook(ctx context.Context, req SendTestDi
 }
 
 func (r *Repository) DispatchDueReminders(ctx context.Context) (ReminderDispatchResult, error) {
-	if r.cfg.Database.SelectedDriver != DriverSQLite {
-		return ReminderDispatchResult{}, errors.New("当前仅实现 SQLite 提醒调度验证")
-	}
-
 	db, err := r.openDB()
 	if err != nil {
 		return ReminderDispatchResult{}, err
@@ -205,9 +201,21 @@ func (r *Repository) enqueueDueTasks(ctx context.Context, db *sql.DB) error {
 					if !member.Enabled {
 						continue
 					}
-					if err := ensureReminderTask(ctx, db, r.cfg.Database.SelectedDriver, event.ID, point.ID, member.ID, member.Type, notifyAt); err != nil {
+					// Encode channel_id: even for group members
+					taskChannelID := (member.ID << 1) | 0
+					if err := ensureReminderTask(ctx, db, r.cfg.Database.SelectedDriver, event.ID, point.ID, taskChannelID, member.Type, notifyAt); err != nil {
 						return err
 					}
+				}
+			}
+			for _, channel := range user.Channels {
+				if !channel.Enabled || !containsInt64(event.BoundChannelIDs, channel.ID) {
+					continue
+				}
+				// Encode channel_id: odd for direct channels
+				taskChannelID := (channel.ID << 1) | 1
+				if err := ensureReminderTask(ctx, db, r.cfg.Database.SelectedDriver, event.ID, point.ID, taskChannelID, channel.Type, notifyAt); err != nil {
+					return err
 				}
 			}
 		}
@@ -285,11 +293,34 @@ func (r *Repository) runPendingTasks(ctx context.Context, db *sql.DB) (ReminderD
 			continue
 		}
 
-		member, groupName, ok := findGroupMember(groupMap[user.ID], task.ChannelID)
-		if !ok {
-			result.Skipped++
-			_ = markTaskDone(ctx, db, r.cfg.Database.SelectedDriver, task.ID, "skipped", "未找到通知组成员")
-			continue
+		var member NotificationGroupMember
+		var groupName string
+		realID := task.ChannelID >> 1
+		isDirect := (task.ChannelID & 1) == 1
+
+		if isDirect {
+			ch, found := findChannel(user.Channels, realID)
+			if !found {
+				result.Skipped++
+				_ = markTaskDone(ctx, db, r.cfg.Database.SelectedDriver, task.ID, "skipped", "未找到个人通知渠道")
+				continue
+			}
+			member = NotificationGroupMember{
+				ID:      ch.ID,
+				Type:    ch.Type,
+				Target:  ch.Target,
+				Label:   ch.Name,
+				Enabled: ch.Enabled,
+			}
+			groupName = "个人渠道"
+			ok = true
+		} else {
+			member, groupName, ok = findGroupMember(groupMap[user.ID], realID)
+			if !ok {
+				result.Skipped++
+				_ = markTaskDone(ctx, db, r.cfg.Database.SelectedDriver, task.ID, "skipped", "未找到通知组成员")
+				continue
+			}
 		}
 
 		logEntry := NotifyLog{
@@ -682,7 +713,8 @@ func computeNotifyAt(event MemoEvent, point ReminderPoint, now time.Time) (time.
 		notifyAt := base.Add(-offset)
 		return notifyAt, !notifyAt.After(now)
 	case "cron":
-		base, ok := latestCronOccurrence(event.RecurrenceExpr, now.Add(offset), 72*time.Hour)
+		// Increase lookback to 31 days to support monthly tasks
+		base, ok := latestCronOccurrence(event.RecurrenceExpr, now.Add(offset), 32*24*time.Hour)
 		if !ok {
 			return time.Time{}, false
 		}
@@ -698,17 +730,19 @@ func isExpiredOneTimeEvent(event MemoEvent, now time.Time) bool {
 	recurrence := strings.ToLower(strings.TrimSpace(event.RecurrenceType))
 	if recurrence == "" || recurrence == "once" {
 		// Allow short scheduling delay (cron tick / queue latency) so "到点提醒" is not dropped.
-		const grace = 10 * time.Minute
+		const grace = 30 * time.Minute // Increased grace for safety
 		return event.EventAt.Add(grace).Before(now)
 	}
 	return false
 }
 
 func latestDailyOccurrence(anchor, now time.Time) time.Time {
-	y, m, d := now.Date()
+	loc := anchor.Location()
+	nowInLoc := now.In(loc)
+	y, m, d := nowInLoc.Date()
 	hh, mm, ss := anchor.Clock()
-	candidate := time.Date(y, m, d, hh, mm, ss, 0, now.Location())
-	if candidate.After(now) {
+	candidate := time.Date(y, m, d, hh, mm, ss, 0, loc)
+	if candidate.After(nowInLoc) {
 		candidate = candidate.AddDate(0, 0, -1)
 	}
 	return candidate
@@ -731,6 +765,8 @@ func latestCronOccurrence(expr string, now time.Time, lookback time.Duration) (t
 	if len(fields) != 5 {
 		return time.Time{}, false
 	}
+	// Cron expressions are typically relative to a specific timezone.
+	// We use the system local time or configured APP_TIMEZONE implicitly via now.Location().
 	start := now.Add(-lookback).Truncate(time.Minute)
 	for t := now.Truncate(time.Minute); !t.Before(start); t = t.Add(-time.Minute) {
 		if cronMatch(fields, t) {

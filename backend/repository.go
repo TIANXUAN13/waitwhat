@@ -1077,15 +1077,29 @@ func buildNotifyPlan(event MemoEvent, db *sql.DB, driver DatabaseDriver) []Upcom
 			groupNames[group.ID] = group.Name
 		}
 	}
+	channelNames := map[int64]string{}
+	channels, err := loadChannels(context.Background(), db, driver, event.UserID)
+	if err == nil {
+		for _, ch := range channels {
+			channelNames[ch.ID] = ch.Name
+		}
+	}
+
 	var picked []string
 	for _, id := range event.BoundGroupIDs {
 		if name, ok := groupNames[id]; ok {
 			picked = append(picked, name)
 		}
 	}
+	for _, id := range event.BoundChannelIDs {
+		if name, ok := channelNames[id]; ok {
+			picked = append(picked, name)
+		}
+	}
+
 	summary := strings.Join(picked, ", ")
 	if summary == "" {
-		summary = "未选择通知组"
+		summary = "未选择通知渠道"
 	}
 	for _, point := range event.ReminderPoints {
 		plans = append(plans, UpcomingNotifyPoint{

@@ -29,7 +29,7 @@ func main() {
 
 func startReminderLoop(repo *Repository) {
 	go func() {
-		ticker := time.NewTicker(1 * time.Minute)
+		ticker := time.NewTicker(10 * time.Second)
 		defer ticker.Stop()
 		for range ticker.C {
 			if _, err := repo.DispatchDueReminders(context.Background()); err != nil {

@@ -233,6 +233,7 @@ function parseEventTimeMs(raw: string) {
 }
 
 function isOnceEventExpired(event: AppState['events'][number]) {
+  if (event.status === 'sent' || event.status === 'failed') return true
   const ts = parseEventTimeMs(event.eventAt)
   if (Number.isFinite(ts)) {
     return ts + ONCE_EVENT_EXPIRE_GRACE_MS < Date.now()
